@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="neo-csrf" content="__CSRF_TOKEN__">
+<meta name="color-scheme" content="light dark">
+<title>Neo Commander</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header class="top">
+    <h1>Neo Commander</h1>
+    <span class="ver">v__VERSION__</span>
+  </header>
+
+  <section id="status" class="card status starting">
+    <div class="spinner" id="spinner" aria-hidden="true"></div>
+    <div>
+      <div class="status-title" id="status-title">Hazırlanıyor…</div>
+      <div class="status-sub" id="status-sub"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Claude'a bağlan</h2>
+    <div id="quick-warning" class="warn" hidden>
+      Bu link bilgisayar yeniden başlayınca değişir — sabit link için Tailscale ayarla (aşağıda “Bağlantı türü”).
+    </div>
+    <label class="lbl">Bağlayıcı adresi</label>
+    <div class="row">
+      <div class="mono big" id="url-box">Bağlantı hazırlanıyor…</div>
+      <button id="copy-url" class="btn primary" disabled>Kopyala</button>
+    </div>
+    <label class="lbl">Sahip PIN'i</label>
+    <div class="row">
+      <div class="mono pin" id="pin-box">••••-••••-••••-••••</div>
+      <button id="toggle-pin" class="btn">Göster</button>
+      <button id="copy-pin" class="btn">Kopyala</button>
+      <button id="regen-pin" class="btn subtle">Yenile</button>
+    </div>
+    <ol class="steps">
+      <li><b>Claude.ai</b> → <b>Ayarlar</b> → <b>Bağlayıcılar</b> → <b>Özel bağlayıcı ekle</b> yolunu açın.</li>
+      <li>Yukarıdaki <b>adresi</b> yapıştırın ve ekleyin.</li>
+      <li>Açılan sayfada yukarıdaki <b>PIN</b>'i girin ve izin verin.</li>
+    </ol>
+  </section>
+
+  <section class="card">
+    <h2>Güvenlik</h2>
+    <div class="kill-row">
+      <button id="kill" class="btn kill">ACİL DURDUR</button>
+      <div class="muted" id="kill-hint">Tüm araç çağrılarını anında engeller.</div>
+    </div>
+    <label class="lbl">Yetki seviyesi</label>
+    <div class="modes" id="modes">
+      <label class="mode"><input type="radio" name="mode" value="full"><span><b>Tam yetki</b><small>Dosya, komut, fare ve klavye dahil her şey.</small></span></label>
+      <label class="mode"><input type="radio" name="mode" value="standard"><span><b>Standart</b><small>Dosya ve komutlar; fare/klavye kontrolü ve ayar araçları yok.</small></span></label>
+      <label class="mode"><input type="radio" name="mode" value="readonly"><span><b>Salt okunur</b><small>Yalnızca okuma, listeleme, arama ve ekran görüntüsü.</small></span></label>
+    </div>
+    <label class="lbl">İzinli klasörler</label>
+    <div class="muted" id="dirs-hint">Boşsa tüm diske erişilebilir.</div>
+    <ul class="list" id="dirs"></ul>
+    <form class="row" id="dir-form">
+      <input id="dir-input" type="text" placeholder="C:\Users\Adınız\Belgeler" autocomplete="off" spellcheck="false">
+      <button class="btn" type="submit">Ekle</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Bağlı istemciler</h2>
+    <ul class="list" id="clients"></ul>
+    <div class="row end"><button id="revoke-all" class="btn subtle">Hepsinin erişimini kaldır</button></div>
+  </section>
+
+  <section class="card">
+    <h2>Canlı etkinlik</h2>
+    <div class="feed-wrap"><table class="feed"><thead><tr><th>Saat</th><th>Araç</th><th>İstemci</th><th>Sonuç</th><th>Süre</th></tr></thead><tbody id="feed"></tbody></table></div>
+    <div class="muted" id="feed-empty">Henüz etkinlik yok.</div>
+  </section>
+
+  <section class="card">
+    <h2>Bağlantı türü</h2>
+    <div class="modes" id="tunnel-kinds">
+      <label class="mode"><input type="radio" name="tkind" value="cloudflare-quick"><span><b>Hızlı tünel (Cloudflare)</b><small>Hesap gerekmez. Adres her açılışta değişir.</small></span></label>
+      <label class="mode"><input type="radio" name="tkind" value="tailscale"><span><b>Tailscale Funnel</b><small>Sabit adres. Ücretsiz Tailscale hesabı gerekir.</small></span></label>
+      <label class="mode"><input type="radio" name="tkind" value="cloudflare-named"><span><b>Cloudflare (sabit, token ile)</b><small>Kendi alan adınız ve Cloudflare tünel token'ı.</small></span></label>
+      <label class="mode"><input type="radio" name="tkind" value="manual"><span><b>Elle adres</b><small>Kendi kurduğunuz bir tünelin https adresi.</small></span></label>
+      <label class="mode"><input type="radio" name="tkind" value="none"><span><b>Kapalı</b><small>Yalnızca bu bilgisayarda.</small></span></label>
+    </div>
+    <div id="tunnel-extra" hidden>
+      <label class="lbl" for="t-url">Genel adres (https://…)</label>
+      <input id="t-url" type="text" placeholder="https://neo.ornek.com" autocomplete="off" spellcheck="false">
+      <div id="t-token-wrap" hidden>
+        <label class="lbl" for="t-token">Cloudflare tünel token'ı</label>
+        <input id="t-token" type="password" placeholder="Kayıtlı (değiştirmek için yenisini yapıştırın)" autocomplete="off">
+      </div>
+    </div>
+    <div class="row">
+      <button id="tunnel-save" class="btn primary">Kaydet ve uygula</button>
+      <button id="tunnel-restart" class="btn">Tüneli yeniden başlat</button>
+    </div>
+    <div class="muted" id="tunnel-msg"></div>
+    <label class="switch"><input type="checkbox" id="autostart"><span>Bilgisayar açılınca otomatik başlat</span></label>
+    <div class="muted" id="autostart-msg"></div>
+  </section>
+
+  <div id="toast" class="toast" hidden></div>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
