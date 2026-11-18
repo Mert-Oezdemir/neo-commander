@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import type { NextFunction, Request, Response, Router } from 'express';
@@ -68,24 +68,41 @@ export function createPanelRouter(deps: PanelDeps): Router {
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Referrer-Policy', 'no-referrer');
-    res.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
+    res.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
     next();
   });
 
-  // 2. Static UI
-  const files: Record<string, [string, string]> = {
-    '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
-    '/style.css': ['style.css', 'text/css; charset=utf-8'],
+  // 2. Static UI (built by `npm run build` in ui/ into panel/).
+  //    index.html carries a per-process CSRF placeholder; hashed files under /assets are immutable.
+  const MIME: Record<string, string> = {
+    '.js': 'text/javascript; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.woff2': 'font/woff2',
+    '.svg': 'image/svg+xml',
+    '.png': 'image/png',
+    '.ico': 'image/x-icon',
+  };
+  const send = (res: Response, file: string, cache: string): void => {
+    try {
+      const body = readFileSync(file);
+      res.setHeader('Content-Type', MIME[extname(file).toLowerCase()] ?? 'application/octet-stream');
+      res.setHeader('Cache-Control', cache);
+      res.send(body);
+    } catch { res.status(404).type('text/plain').send('Not Found'); }
   };
   router.get(['/', '/index.html'], (_req, res) => {
     try {
-      const html = readFileSync(join(panelDir, 'index.html'), 'utf8').replace('__CSRF_TOKEN__', csrf).replace('__VERSION__', deps.version.replace(/[^0-9A-Za-z._-]/g, ''));
+      const html = readFileSync(join(panelDir, 'index.html'), 'utf8').replace('__NEO_CSRF__', csrf);
+      // Holds the CSRF token: never cache.
       res.type('text/html; charset=utf-8').send(html);
     } catch { res.status(500).type('text/plain').send('Panel dosyaları bulunamadı.'); }
   });
-  router.get(Object.keys(files), (req, res) => {
-    const [name, type] = files[req.path]!;
-    try { res.type(type).send(readFileSync(join(panelDir, name))); } catch { res.status(404).end(); }
+  router.get('/favicon.svg', (_req, res) => { send(res, join(panelDir, 'favicon.svg'), 'public, max-age=3600'); });
+  router.get('/assets/:file', (req, res) => {
+    const name = String(req.params.file);
+    if (!/^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(name) || !MIME[extname(name).toLowerCase()]) { res.status(404).type('text/plain').send('Not Found'); return; }
+    const hashed = /-[A-Za-z0-9_-]{8,}\.[a-z0-9]+$/.test(name);
+    send(res, join(panelDir, 'assets', name), hashed ? 'public, max-age=31536000, immutable' : 'no-cache');
   });
 
   // 3. API guards

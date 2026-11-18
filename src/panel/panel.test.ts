@@ -61,18 +61,45 @@ async function csrf(): Promise<string> {
   const r = await req('GET', '/panel/');
   assert.equal(r.status, 200);
   const m = r.body.match(/name="neo-csrf" content="([^"]+)"/);
-  assert.ok(m && m[1] !== '__CSRF_TOKEN__');
+  assert.ok(m && m[1] !== '__NEO_CSRF__');
   return m[1];
 }
 
-test('loopback GET serves UI and static assets', async () => {
-  assert.equal((await req('GET', '/panel/')).status, 200);
-  const js = await req('GET', '/panel/app.js');
-  assert.equal(js.status, 200);
-  assert.match(js.headers['content-type'] ?? '', /javascript/);
-  assert.equal((await req('GET', '/panel/style.css')).status, 200);
+test('loopback GET serves the built UI, hashed assets and favicon with correct types and cache headers', async () => {
+  const page = await req('GET', '/panel/');
+  assert.equal(page.status, 200);
+  assert.match(page.headers['content-type'] ?? '', /text\/html/);
+  assert.match(page.headers['cache-control'] ?? '', /no-store/);
+  assert.ok(!page.body.includes('__NEO_CSRF__'), 'CSRF placeholder replaced');
+  assert.ok(!/<script(?![^>]*\bsrc=)[^>]*>/.test(page.body), 'no inline scripts');
+  assert.ok(!/\sstyle=|<style/i.test(page.body), 'no inline styles');
+  const csp = String(page.headers['content-security-policy']);
+  assert.match(csp, /script-src 'self';/);
+  assert.ok(!/unsafe-inline|unsafe-eval/.test(csp));
+  const js = page.body.match(/src="(\/panel\/assets\/[^"]+\.js)"/)?.[1];
+  const css = page.body.match(/href="(\/panel\/assets\/[^"]+\.css)"/)?.[1];
+  assert.ok(js && css, 'index.html references hashed js + css under /panel/assets');
+  const jsRes = await req('GET', js);
+  assert.equal(jsRes.status, 200);
+  assert.match(jsRes.headers['content-type'] ?? '', /javascript/);
+  assert.match(jsRes.headers['cache-control'] ?? '', /immutable/);
+  const cssRes = await req('GET', css);
+  assert.equal(cssRes.status, 200);
+  assert.match(cssRes.headers['content-type'] ?? '', /text\/css/);
+  const font = cssRes.body.match(/\/panel\/assets\/[^")]+\.woff2/)?.[0];
+  assert.ok(font, 'css references a self-hosted font');
+  const fontRes = await req('GET', font);
+  assert.equal(fontRes.status, 200);
+  assert.match(fontRes.headers['content-type'] ?? '', /font\/woff2/);
+  const ico = await req('GET', '/panel/favicon.svg');
+  assert.equal(ico.status, 200);
+  assert.match(ico.headers['content-type'] ?? '', /image\/svg/);
+  assert.equal((await req('GET', '/panel/assets/nope-12345678.js')).status, 404);
+  assert.equal((await req('GET', '/panel/assets/..%2Findex.html')).status, 404);
+  assert.equal((await req('GET', '/panel/assets/index.html')).status, 404);
   assert.equal((await req('GET', '/panel/../../etc/passwd')).status, 404);
   assert.equal((await req('GET', '/panel/package.json')).status, 404);
+  assert.equal((await req('GET', '/panel/app.js')).status, 404);
 });
 
 test('localhost host header is accepted', async () => {

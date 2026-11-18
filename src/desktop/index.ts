@@ -17,6 +17,7 @@ import {
   parseWait,
   parseWindow,
 } from './parse.js';
+import { macRuns } from './mac-tools.js';
 import { hooks, PsError, WINDOWS_ONLY } from './ps.js';
 import {
   SCRIPT_CLIPBOARD_GET,
@@ -58,10 +59,14 @@ function define(
   return {
     ...rest,
     async handler(args, ctx) {
-      if (!hooks.isWindows()) return textResult(WINDOWS_ONLY, true);
+      // Platform dispatch: Windows runs the PowerShell implementation, macOS the JXA/CLI one (mac-tools.ts).
+      let impl: Run;
+      if (hooks.isWindows()) impl = run;
+      else if (hooks.isMac()) impl = macRuns[rest.name] ?? run;
+      else return textResult(WINDOWS_ONLY, true);
       const exec = async (): Promise<CallToolResult> => {
         try {
-          return await run(args ?? {}, ctx);
+          return await impl(args ?? {}, ctx);
         } catch (e) {
           if (e instanceof ArgError || e instanceof KeyError || e instanceof PsError) {
             return textResult(e.message, true);
@@ -82,14 +87,19 @@ function num(v: unknown): number {
   return typeof v === 'number' ? v : Number(v);
 }
 
-const COORD_NOTE =
+const COORD_NOTE_WIN =
   'Coordinates are physical screen pixels in the Windows virtual desktop: origin (0,0) is the top-left of the PRIMARY monitor; ' +
   'monitors left of / above it have negative coordinates. The process is DPI-aware, so these match screenshot pixels at scale 1.';
+
+const COORD_NOTE_MAC =
+  'Coordinates are screen POINTS (logical pixels, not Retina device pixels) in the macOS global display space: origin (0,0) is the top-left of the PRIMARY display (the one with the menu bar); ' +
+  'displays left of / above it have negative coordinates. Mouse events use the same points, and screenshot captions map image pixels back to points, so coordinates from screenshots and OCR can be passed straight to desktop_mouse.';
 
 const WORKFLOW =
   'Recommended workflow: desktop_screenshot -> locate the target (use desktop_ocr for exact text positions) -> act with desktop_mouse / desktop_keyboard -> verify with another desktop_screenshot.';
 
-const targetProps = {
+function targetPropsFor(mac: boolean) {
+  return {
   monitor: { type: 'integer', minimum: 0, description: 'Monitor index from desktop_list_monitors (default: primary monitor).' },
   region: {
     type: 'object',
@@ -102,11 +112,27 @@ const targetProps = {
     },
     required: ['x', 'y', 'width', 'height'],
   },
-  window: { type: 'string', description: 'Capture the visible window whose title contains this text (case-insensitive). The capture is of the screen area, so windows covering it appear too; focus it first if needed.' },
+  window: {
+    type: 'string',
+    description: mac
+      ? 'Capture the visible window whose title or application name contains this text (case-insensitive). Only that window is captured, even if partly covered.'
+      : 'Capture the visible window whose title contains this text (case-insensitive). The capture is of the screen area, so windows covering it appear too; focus it first if needed.',
+  },
   handle: { type: 'integer', description: 'Capture the window with this handle (from desktop_list_windows).' },
-};
+  };
+}
 
-export function desktopTools(): ToolDef[] {
+export type DesktopPlatform = 'win32' | 'darwin';
+
+/**
+ * The same tool names, schemas and result shapes on every platform; only the wording of descriptions follows the OS
+ * the server runs on (default: detected through the platform hooks).
+ */
+export function desktopTools(platform?: DesktopPlatform): ToolDef[] {
+  const mac = (platform ?? (hooks.isMac() ? 'darwin' : 'win32')) === 'darwin';
+  const OS = mac ? 'macOS' : 'Windows';
+  const COORD_NOTE = mac ? COORD_NOTE_MAC : COORD_NOTE_WIN;
+  const targetProps = targetPropsFor(mac);
   const tools: ToolDef[] = [];
   const readOnly = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
   const t = (risk: Risk, def: Omit<ToolDef, 'risk' | 'handler'> & { run: Run; serialized?: boolean }): void => {
@@ -116,7 +142,8 @@ export function desktopTools(): ToolDef[] {
   t('read', {
     name: 'desktop_screenshot',
     description:
-      'Capture the Windows screen (a monitor, a region, or a window) and return it as an image. ' +
+      `Capture the ${OS} screen (a monitor, a region, or a window) and return it as an image. ` +
+      (mac ? 'Needs the Screen Recording permission. ' : '') +
       'The caption states the original capture size, the scale factor and the screen-coordinate offset of the image\'s top-left corner, so you can map image pixels back to screen coordinates: ' +
       'screenX = offsetX + imageX / scale, screenY = offsetY + imageY / scale. ' +
       `${COORD_NOTE} Large captures are downscaled to maxWidth (default 1600) to save tokens; pass a smaller region or a larger maxWidth for fine detail. ` +
@@ -152,9 +179,12 @@ export function desktopTools(): ToolDef[] {
   t('read', {
     name: 'desktop_ocr',
     description:
-      'Run Windows OCR (Windows.Media.Ocr) on the screen, a monitor, a region or a window and return text lines with bounding boxes in SCREEN coordinates (x, y, width, height). ' +
+      (mac ? 'Run macOS OCR (Vision framework, accurate mode; needs the Screen Recording permission)' : 'Run Windows OCR (Windows.Media.Ocr)') +
+      ' on the screen, a monitor, a region or a window and return text lines with bounding boxes in SCREEN coordinates (x, y, width, height). ' +
       'Use `find` to return only the lines/words containing that text (case-insensitive) together with their center point (centerX, centerY), which you can pass straight to desktop_mouse click. ' +
-      'Uses the user profile language, falling back to en-US; pass `language` (e.g. "tr", "en-US") to override if that language pack is installed. ' +
+      (mac
+        ? 'Uses the user locale language plus en-US with automatic language detection; pass `language` (e.g. "tr", "en-US") to force one if Vision supports it (unsupported tags fall back to en-US; the used language is reported). '
+        : 'Uses the user profile language, falling back to en-US; pass `language` (e.g. "tr", "en-US") to override if that language pack is installed. ') +
       `${COORD_NOTE} OCR can miss small, low-contrast or stylised text - verify with desktop_screenshot before clicking.`,
     inputSchema: {
       type: 'object',
@@ -198,7 +228,10 @@ export function desktopTools(): ToolDef[] {
     name: 'desktop_list_windows',
     description:
       'List visible top-level windows (front-to-back z-order): handle, title, process name, pid, rectangle (screen coords), minimized, maximized and focused flags. ' +
-      'Use the handle with desktop_window / desktop_screenshot for unambiguous targeting. Optional `filter` keeps only titles containing that text.',
+      'Use the handle with desktop_window / desktop_screenshot for unambiguous targeting. Optional `filter` keeps only titles containing that text.' +
+      (mac
+        ? ' On macOS the handle is the CGWindowID, `process` is the application name, minimized also marks hidden/off-screen windows, and titles of other apps need the Screen Recording permission (filter then also matches the application name).'
+        : ''),
     inputSchema: {
       type: 'object',
       properties: {
@@ -219,8 +252,12 @@ export function desktopTools(): ToolDef[] {
   t('control', {
     name: 'desktop_window',
     description:
-      'Control a window: focus (reliably brings it to the foreground, restoring it if minimized), minimize, maximize, restore, close (sends WM_CLOSE - the app may ask to save), ' +
-      'move (needs x,y) or resize (needs width,height). Identify the window by `handle` (preferred, from desktop_list_windows) or by `title` substring (case-insensitive; the focused match wins). ' +
+      (mac
+        ? 'Control a window (needs the Accessibility permission): focus (activates the app and raises the window, un-minimizing it), minimize, maximize (fills the display work area), restore (un-minimize, or back to the size before maximize), close (presses the close button - the app may ask to save), '
+        : 'Control a window: focus (reliably brings it to the foreground, restoring it if minimized), minimize, maximize, restore, close (sends WM_CLOSE - the app may ask to save), ') +
+      'move (needs x,y) or resize (needs width,height). Identify the window by `handle` (preferred, from desktop_list_windows) or by `title` substring (case-insensitive' +
+      (mac ? ', also matches the application name' : '') +
+      '; the focused match wins). ' +
       'Returns the window state afterwards. Focus a window before typing into it.',
     inputSchema: {
       type: 'object',
@@ -245,9 +282,9 @@ export function desktopTools(): ToolDef[] {
   t('control', {
     name: 'desktop_mouse',
     description:
-      'Move/click/drag/scroll the mouse with real input events (SendInput). Actions: move, click, double_click, right_click, middle_click, drag (from x,y or current position to to_x,to_y), ' +
+      `Move/click/drag/scroll the mouse with real input events (${mac ? 'CGEvent; needs the Accessibility permission' : 'SendInput'}). Actions: move, click, double_click, right_click, middle_click, drag (from x,y or current position to to_x,to_y), ` +
       'scroll (amount in wheel notches: positive = up, negative = down; set horizontal for sideways), position (read the cursor). ' +
-      'x,y are screen coordinates (omit both to act at the current cursor position). Optional `modifiers` (ctrl, shift, alt, win) are held during the action, e.g. ctrl+click. ' +
+      'x,y are screen coordinates (omit both to act at the current cursor position). Optional `modifiers` (ctrl, shift, alt, ' + (mac ? 'cmd; win/meta/super also mean cmd' : 'win') + ') are held during the action, e.g. ' + (mac ? 'cmd+click' : 'ctrl+click') + '. ' +
       `${COORD_NOTE} ${WORKFLOW}`,
     inputSchema: {
       type: 'object',
@@ -259,7 +296,7 @@ export function desktopTools(): ToolDef[] {
         to_y: { type: 'integer', description: 'Drag end Y.' },
         amount: { type: 'integer', minimum: -100, maximum: 100, description: 'Scroll notches: + up, - down.' },
         horizontal: { type: 'boolean', description: 'Scroll horizontally instead of vertically.' },
-        modifiers: { type: 'array', items: { type: 'string', enum: ['ctrl', 'shift', 'alt', 'win'] }, description: 'Keys held during the action.' },
+        modifiers: { type: 'array', items: { type: 'string', enum: ['ctrl', 'shift', 'alt', 'win', 'cmd'] }, description: 'Keys held during the action.' },
       },
       required: ['action'],
     },
@@ -273,11 +310,15 @@ export function desktopTools(): ToolDef[] {
   t('control', {
     name: 'desktop_keyboard',
     description:
-      'Send real keyboard input to the focused window. Actions: ' +
+      `Send real keyboard input to the focused window${mac ? ' (needs the Accessibility permission)' : ''}. Actions: ` +
       '"type" - types literal Unicode text (any language, incl. Turkish characters; newline = Enter, tab = Tab; up to 10000 chars); ' +
-      '"hotkey" - a key combination such as "ctrl+shift+esc", "win+r", "alt+tab", "ctrl+c", "alt+f4", "enter", "f5" (modifiers ctrl/shift/alt/win then one key); ' +
-      '"press" - a single key, optionally repeated (e.g. key "down", repeat 5). Key names: a-z, 0-9, f1-f24, enter, esc, tab, space, backspace, delete, insert, home, end, pageup, pagedown, up/down/left/right, numpad0-9, volumeup/down/mute, punctuation. ' +
-      'Make sure the right window has focus first (desktop_window focus) and verify with a screenshot. For very long text prefer desktop_clipboard_set then hotkey ctrl+v.',
+      (mac
+        ? '"hotkey" - a key combination such as "cmd+c", "cmd+space", "cmd+tab", "cmd+shift+4", "ctrl+cmd+q", "alt+left", "enter", "f5" (modifiers ctrl/shift/alt(=option)/cmd/fn then one key; win/meta/super are aliases of cmd, ctrl stays the Control key); '
+        : '"hotkey" - a key combination such as "ctrl+shift+esc", "win+r", "alt+tab", "ctrl+c", "alt+f4", "enter", "f5" (modifiers ctrl/shift/alt/win then one key); ') +
+      (mac
+        ? '"press" - a single key, optionally repeated (e.g. key "down", repeat 5). Key names: a-z, 0-9, f1-f20, enter, esc, tab, space, backspace (the Mac delete key), delete (forward delete), home, end, pageup, pagedown, up/down/left/right, numpad0-9, volumeup/down/mute, playpause, punctuation. '
+        : '"press" - a single key, optionally repeated (e.g. key "down", repeat 5). Key names: a-z, 0-9, f1-f24, enter, esc, tab, space, backspace, delete, insert, home, end, pageup, pagedown, up/down/left/right, numpad0-9, volumeup/down/mute, punctuation. ') +
+      'Make sure the right window has focus first (desktop_window focus) and verify with a screenshot. For very long text prefer desktop_clipboard_set then hotkey ' + (mac ? 'cmd+v.' : 'ctrl+v.'),
     inputSchema: {
       type: 'object',
       properties: {
@@ -301,7 +342,7 @@ export function desktopTools(): ToolDef[] {
   t('read', {
     name: 'desktop_clipboard_get',
     description:
-      'Read the Windows clipboard text. Also reports whether the clipboard holds an image (with its size) or a list of files (with paths), which are not returned as content. Text is truncated to maxChars (default 20000).',
+      `Read the ${OS} clipboard text. Also reports whether the clipboard holds an image (with its size) or a list of files (with paths), which are not returned as content. Text is truncated to maxChars (default 20000).`,
     inputSchema: { type: 'object', properties: { maxChars: { type: 'integer', minimum: 1, maximum: 1000000, default: 20000 } } },
     annotations: { ...readOnly, title: 'Clipboard (read)' },
     async run(args, ctx) {
@@ -325,7 +366,7 @@ export function desktopTools(): ToolDef[] {
 
   t('control', {
     name: 'desktop_clipboard_set',
-    description: 'Replace the Windows clipboard contents with the given text (max 25000 characters; empty string clears it). Useful with desktop_keyboard hotkey ctrl+v to paste long text.',
+    description: `Replace the ${OS} clipboard contents with the given text (max 25000 characters; empty string clears it). Useful with desktop_keyboard hotkey ${mac ? 'cmd+v' : 'ctrl+v'} to paste long text.`,
     inputSchema: {
       type: 'object',
       properties: { text: { type: 'string', description: 'Text to place on the clipboard.' } },
@@ -341,8 +382,11 @@ export function desktopTools(): ToolDef[] {
   t('exec', {
     name: 'desktop_open',
     description:
-      'Open a URL (default browser), a file or folder (default app / Explorer), or launch an application by name ("notepad", "calc", "chrome", "code") or full path, via Start-Process. ' +
-      'Optional `args` (array of strings; a plain string is split on spaces, honouring double quotes) are passed to the program. Returns the pid when Windows provides one (URLs and documents often have none). ' +
+      (mac
+        ? 'Open a URL (default browser), a file or folder (default app / Finder), or launch an application by name ("Safari", "TextEdit", "chrome", "code"; common Windows names are mapped) or by path (.app bundles and executables), via `open`. ' +
+          'Optional `args` (array of strings; a plain string is split on spaces, honouring double quotes) are passed to the program (applications and executables only). Returns a pid only for directly started executables. '
+        : 'Open a URL (default browser), a file or folder (default app / Explorer), or launch an application by name ("notepad", "calc", "chrome", "code") or full path, via Start-Process. ' +
+          'Optional `args` (array of strings; a plain string is split on spaces, honouring double quotes) are passed to the program. Returns the pid when Windows provides one (URLs and documents often have none). ') +
       'Follow with desktop_list_windows / desktop_screenshot to see the result.',
     inputSchema: {
       type: 'object',
@@ -363,7 +407,8 @@ export function desktopTools(): ToolDef[] {
   t('read', {
     name: 'desktop_system_info',
     description:
-      'Snapshot of the PC: OS version, hostname, user, CPU model/cores/load, RAM total/free, fixed disks with free space, uptime, battery (if any), top 10 processes by CPU (percent of one core) and by memory, and IPv4 addresses of network adapters.',
+      'Snapshot of the PC: OS version, hostname, user, CPU model/cores/load, RAM total/free, fixed disks with free space, uptime, battery (if any), top 10 processes by CPU (percent of one core) and by memory, and IPv4 addresses of network adapters.' +
+      (mac ? ' On macOS it also reports whether the Accessibility and Screen Recording permissions are granted (`permissions`), with instructions when they are not.' : ''),
     inputSchema: { type: 'object', properties: {} },
     annotations: { ...readOnly, title: 'System info' },
     async run(_args, ctx) {
@@ -374,7 +419,7 @@ export function desktopTools(): ToolDef[] {
   t('control', {
     name: 'desktop_notify',
     description:
-      'Show a Windows toast/balloon notification to the owner (title max 63 chars, message max 255). Use it to get the owner\'s attention or report completion; it does not wait for a click.',
+      `Show a ${OS} ${mac ? 'notification' : 'toast/balloon notification'} to the owner (title max 63 chars, message max 255). Use it to get the owner's attention or report completion; it does not wait for a click.`,
     inputSchema: {
       type: 'object',
       properties: {

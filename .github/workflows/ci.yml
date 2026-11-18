@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      # --ignore-scripts: Desktop Commander's own postinstall phones home. @vscode/ripgrep ships its
+      # binary as a per-platform optional dependency, so nothing needs to run for it.
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Build panel UI (if present)
+        if: hashFiles('ui/package.json') != ''
+        shell: bash
+        working-directory: ui
+        run: npm ci --no-audit --no-fund && npm run build
+      # npm test = tsc (server) + tsc -p electron + node --test for both
+      - run: npm test
+      - name: Desktop smoke (macOS, non-fatal)
+        if: runner.os == 'macOS' && hashFiles('scripts/desktop-smoke.mjs') != ''
+        continue-on-error: true
+        run: node scripts/desktop-smoke.mjs 2>&1 | tee desktop-smoke.txt
+      - name: Upload smoke output
+        if: runner.os == 'macOS' && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-smoke-macos
+          path: desktop-smoke.txt
+          if-no-files-found: ignore
+
+  package-config:
+    name: packaging smoke (linux dir)
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: node node_modules/electron/install.js
+      - name: Build panel UI (if present)
+        if: hashFiles('ui/package.json') != ''
+        working-directory: ui
+        run: npm ci --no-audit --no-fund && npm run build
+      - run: npm run dist:dir -- --linux

@@ -4,7 +4,7 @@ import { unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-export const WINDOWS_ONLY = "Bu araç yalnızca Windows'ta çalışır / Windows only";
+export const WINDOWS_ONLY = "Bu araç yalnızca Windows ve macOS'ta çalışır / Windows and macOS only";
 
 export class PsError extends Error {}
 
@@ -146,7 +146,8 @@ export function parsePsOutput(stdout: string, stderr: string, code: number | nul
 }
 
 /** Test seams: platform + runner can be overridden. */
-export const hooks: { isWindows: () => boolean; run: PsRunner } = {
+export const hooks: { isWindows: () => boolean; isMac: () => boolean; run: PsRunner } = {
   isWindows: () => process.platform === 'win32',
+  isMac: () => process.platform === 'darwin',
   run: runPowerShell,
 };

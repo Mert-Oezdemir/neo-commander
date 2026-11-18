@@ -29,6 +29,10 @@ if (fake) {
   };
   syncBuiltinESMExports();
 }
+// Under Electron the child is the Electron binary in node mode (ELECTRON_RUN_AS_NODE=1).
+// Do not leak that flag to shells/programs Desktop Commander launches for the user
+// (an Electron app such as VS Code started from there would otherwise behave like plain node).
+delete process.env.ELECTRON_RUN_AS_NODE;
 `;
 
 export const DC_CONFIG_OVERRIDES = {
@@ -43,7 +47,34 @@ export const DC_CONFIG_OVERRIDES = {
 export function resolveDcEntry(): string {
   const require = createRequire(import.meta.url);
   const pkg = require.resolve('@wonderwhy-er/desktop-commander/package.json');
-  return join(dirname(pkg), 'dist', 'index.js');
+  return unpackedPath(join(dirname(pkg), 'dist', 'index.js'));
+}
+
+/**
+ * Packaged Electron app: files inside `app.asar` that were listed in `asarUnpack` also exist
+ * on disk under `app.asar.unpacked`. A child process must be given the real path (it is not
+ * necessarily asar-aware), so map it when that file exists.
+ */
+export function unpackedPath(p: string, exists: (f: string) => boolean = existsSync): string {
+  const m = /^(.*[\\/]app)\.asar([\\/].*)$/.exec(p);
+  if (!m) return p;
+  const real = `${m[1]}.asar.unpacked${m[2]}`;
+  return exists(real) ? real : p;
+}
+
+/** True when this process is the Electron main process (execPath is then the Electron binary, not node). */
+export function runningUnderElectron(): boolean {
+  return Boolean(process.versions.electron);
+}
+
+/** Environment for the Desktop Commander child. `electron` makes execPath behave as plain node. */
+export function buildChildEnv(base: NodeJS.ProcessEnv, fakeHome: string, electron: boolean): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(base)) if (v !== undefined) env[k] = v;
+  env.DESKTOP_COMMANDER_DISABLE_TELEMETRY = '1';
+  env.NEO_DC_HOME = fakeHome;
+  if (electron) env.ELECTRON_RUN_AS_NODE = '1';
+  return env;
 }
 
 /** Writes/refreshes the isolated DC config. Returns the fake HOME dir. */
@@ -68,6 +99,8 @@ export interface EngineOptions {
   /** Override DC entry (tests). */
   entry?: string;
   startupTimeoutMs?: number;
+  /** Treat process.execPath as the Electron binary (default: auto-detect). Tests inject it. */
+  electron?: boolean;
   backoffMinMs?: number;
   backoffMaxMs?: number;
 }
@@ -118,10 +151,7 @@ export class Engine extends EventEmitter {
   private async doConnect(): Promise<void> {
     const fakeHome = prepareDcHome(this.opts.stateDir);
     const entry = this.opts.entry ?? resolveDcEntry();
-    const env: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
-    env.DESKTOP_COMMANDER_DISABLE_TELEMETRY = '1';
-    env.NEO_DC_HOME = fakeHome;
+    const env = buildChildEnv(process.env, fakeHome, this.opts.electron ?? runningUnderElectron());
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: ['--import', 'data:text/javascript,' + encodeURIComponent(PRELOAD_SOURCE), entry, '--no-onboarding'],

@@ -22,9 +22,11 @@ const EXPECTED: Record<string, string> = {
 };
 
 const origWin = hooks.isWindows;
+const origMac = hooks.isMac;
 const origRun = hooks.run;
 afterEach(() => {
   hooks.isWindows = origWin;
+  hooks.isMac = origMac;
   hooks.run = origRun;
 });
 
@@ -69,8 +71,9 @@ describe('desktop_open policy flags', () => {
 });
 
 describe('non-Windows', () => {
-  it('every handler returns the Windows-only error', async () => {
+  it('every handler returns the unsupported-platform error', async () => {
     hooks.isWindows = () => false;
+    hooks.isMac = () => false;
     let called = false;
     hooks.run = async () => {
       called = true;
@@ -84,7 +87,7 @@ describe('non-Windows', () => {
     assert.equal(called, false);
   });
   it('real platform on this CI is not win32 (or handlers still safe)', async () => {
-    if (process.platform === 'win32') return;
+    if (process.platform === 'win32' || process.platform === 'darwin') return;
     const r = await desktopTools()[0]!.handler({}, ctx);
     assert.equal(r.isError, true);
   });

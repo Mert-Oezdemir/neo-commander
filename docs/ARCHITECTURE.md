@@ -15,7 +15,7 @@ Claude.ai ──HTTPS/OAuth 2.1──► tunnel (cloudflared / tailscale funnel)
                          │  ├─ policy/ mode, kill switch, path & command guards,
                          │  │          rate limit, audit log
                          │  ├─ engine/ Desktop Commander (pinned npm dep) over stdio
-                         │  ├─ desktop/ own Windows tools (screen, OCR, input,
+                         │  ├─ desktop/ own desktop tools, Windows + macOS (screen, OCR, input,
                          │  │          windows, clipboard, apps, system)
                          │  ├─ tunnel/ cloudflared download+verify, quick/named
                          │  │          tunnel, tailscale funnel detection
@@ -71,5 +71,8 @@ Mode → allowed risk: `readonly` = read; `standard` = read, write, exec;
 | `src/policy/*` | modes, risk map, guards, rate limit, audit |
 | `src/desktop/*` | own desktop tools (Windows first, graceful elsewhere) |
 | `src/tunnel/*` | cloudflared / tailscale |
-| `src/panel/*` + `panel/` | loopback panel API + static UI |
+| `src/panel/*` | loopback panel API + static file serving (CSRF token injected into index.html) |
+| `ui/` → `panel/` | React + Vite control panel source (`cd ui && npm run build` emits the committed `panel/` bundle) |
 | `scripts/`, `Neo-Commander.cmd` | one-click install/start |
+| `electron/` → `dist-electron/` | desktop shell: runs `startServer()` in-process, window + tray/menu bar, single instance; packaged by electron-builder (`build` key in package.json). DC child runs with `ELECTRON_RUN_AS_NODE=1`; `node_modules` is unpacked from the asar |
+| `assets/` | app/tray icons (`npm run icons` regenerates PNGs from SVG) |

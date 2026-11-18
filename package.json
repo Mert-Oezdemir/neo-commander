@@ -2,13 +2,19 @@
   "name": "neo-commander",
   "version": "0.1.0",
   "description": "Self-hosted remote MCP: let Claude.ai operate your own computer, no paid relay",
-  "main": "dist/index.js",
+  "main": "dist-electron/main.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "tsc && node --test --test-concurrency=1 \"dist/**/*.test.js\"",
-    "typecheck": "tsc --noEmit"
+    "test": "tsc && tsc -p electron && node --test --test-concurrency=1 \"dist/**/*.test.js\" \"dist-electron/**/*.test.js\"",
+    "typecheck": "tsc --noEmit",
+    "build:electron": "tsc && tsc -p electron",
+    "app:dev": "npm run build:electron && electron .",
+    "icons": "node scripts/make-icons.mjs",
+    "dist:win": "npm run build:electron && electron-builder --win nsis --x64 --publish never",
+    "dist:mac": "npm run build:electron && electron-builder --mac dmg --publish never",
+    "dist:dir": "npm run build:electron && electron-builder --dir --publish never"
   },
   "license": "MIT",
   "dependencies": {
@@ -18,8 +24,11 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.6",
+    "electron": "^45.3.4",
+    "electron-builder": "^26.18.0",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   },
@@ -30,5 +39,92 @@
   },
   "bin": {
     "neo-commander": "dist/index.js"
+  },
+  "author": "Neo Commander contributors",
+  "homepage": "https://github.com/Mert-Oezdemir/neo-commander",
+  "build": {
+    "appId": "dev.mertoezdemir.neocommander",
+    "productName": "Neo Commander",
+    "copyright": "MIT License",
+    "directories": {
+      "buildResources": "assets",
+      "output": "release"
+    },
+    "asar": true,
+    "files": [
+      "package.json",
+      "dist/**/*",
+      "dist-electron/**/*",
+      "panel/**/*",
+      "assets/icon.png",
+      "assets/tray*.png",
+      "!**/*.test.js",
+      "!**/*.map",
+      "!**/*.d.ts",
+      "!dist/**/*.test.*",
+      "!dist-electron/**/*.test.*",
+      "!**/node_modules/**/{test,tests,__tests__,docs,example,examples}/**",
+      "!**/node_modules/*/{CHANGELOG.md,README.md,readme.md,HISTORY.md}"
+    ],
+    "asarUnpack": [
+      "node_modules/**"
+    ],
+    "artifactName": "Neo-Commander-${version}-${os}-${arch}.${ext}",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Neo Commander",
+      "installerLanguages": [
+        "tr_TR",
+        "en_US"
+      ],
+      "multiLanguageInstaller": true,
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        {
+          "target": "dmg"
+        }
+      ],
+      "icon": "icon.png",
+      "hardenedRuntime": false,
+      "identity": null,
+      "gatekeeperAssess": false,
+      "extendInfo": {
+        "NSAppleEventsUsageDescription": "Neo Commander, Claude'un isteği üzerine diğer uygulamaları denetleyebilmek için bu izne ihtiyaç duyar.",
+        "NSAccessibilityUsageDescription": "Neo Commander, Claude'un isteği üzerine fare ve klavyeyi kullanabilmek için Erişilebilirlik iznine ihtiyaç duyar.",
+        "NSScreenCaptureUsageDescription": "Neo Commander, Claude'un isteği üzerine ekran görüntüsü alabilmek için Ekran Kaydı iznine ihtiyaç duyar.",
+        "NSDesktopFolderUsageDescription": "Neo Commander, Claude'un isteği üzerine Masaüstü klasöründeki dosyalara erişebilir.",
+        "NSDocumentsFolderUsageDescription": "Neo Commander, Claude'un isteği üzerine Belgeler klasöründeki dosyalara erişebilir.",
+        "NSDownloadsFolderUsageDescription": "Neo Commander, Claude'un isteği üzerine İndirilenler klasöründeki dosyalara erişebilir."
+      }
+    },
+    "dmg": {
+      "title": "Neo Commander ${version}",
+      "sign": false
+    },
+    "linux": {
+      "target": "dir",
+      "category": "Utility"
+    },
+    "npmRebuild": false,
+    "afterPack": "scripts/after-pack.cjs"
   }
 }

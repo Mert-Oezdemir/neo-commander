@@ -1,0 +1,93 @@
+@font-face {
+  font-family: 'Bricolage Grotesque';
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url('../fonts/bricolage-grotesque-latin-ext-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: 'Bricolage Grotesque';
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+  src: url('../fonts/bricolage-grotesque-latin-wght-normal.woff2') format('woff2-variations');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+:root {
+  --font-display: 'Bricolage Grotesque', 'Segoe UI Variable Display', 'Segoe UI', system-ui, sans-serif;
+  --font-body: 'Segoe UI Variable Text', 'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', Roboto, sans-serif;
+  --font-mono: ui-monospace, 'Cascadia Code', 'SF Mono', Consolas, 'Liberation Mono', monospace;
+
+  --r-card: 16px;
+  --r-ctl: 10px;
+  --side-w: 248px;
+
+  /* Light */
+  --bg: #edf0f6;
+  --surface: #ffffff;
+  --surface-2: #f4f6fa;
+  --ink: #0f1728;
+  --ink-2: #3f4b60;
+  --muted: #586478;
+  --line: #d8deea;
+  --line-strong: #bcc6d6;
+
+  --accent: #3445d6;
+  --accent-hover: #2735b8;
+  --accent-ink: #ffffff;
+  --accent-soft: #e6e9fd;
+  --accent-text: #2a39b8;
+
+  --ok: #0a7a4b;
+  --ok-soft: #dcf4e9;
+  --warn: #8a5200;
+  --warn-soft: #fff0d0;
+  --danger: #b81f27;
+  --danger-soft: #fde6e7;
+  --danger-solid: #b81f27;
+  --danger-solid-hover: #9d151d;
+
+  --side-bg: #0d1524;
+  --side-ink: #e8edf8;
+  --side-muted: #9ca8c0;
+  --side-line: #1d2941;
+  --side-on: rgba(154, 166, 255, 0.16);
+  --side-accent: #aab4ff;
+
+  --shadow-pop: 0 18px 50px -12px rgba(10, 18, 40, 0.35), 0 2px 8px rgba(10, 18, 40, 0.12);
+  color-scheme: light;
+}
+
+:root[data-theme='dark'] {
+  --bg: #0a0f18;
+  --surface: #121a28;
+  --surface-2: #172134;
+  --ink: #eaeff9;
+  --ink-2: #b9c4d8;
+  --muted: #98a5bb;
+  --line: #232f45;
+  --line-strong: #364560;
+
+  --accent: #8e9bff;
+  --accent-hover: #a5afff;
+  --accent-ink: #0a0f18;
+  --accent-soft: #1d2650;
+  --accent-text: #aab4ff;
+
+  --ok: #4fdba0;
+  --ok-soft: #10342a;
+  --warn: #f4bb52;
+  --warn-soft: #3a2b0d;
+  --danger: #ff8086;
+  --danger-soft: #3b1519;
+  --danger-solid: #d02f38;
+  --danger-solid-hover: #e03a43;
+
+  --side-bg: #070b13;
+  --side-line: #18233a;
+
+  --shadow-pop: 0 18px 50px -12px rgba(0, 0, 0, 0.7), 0 2px 8px rgba(0, 0, 0, 0.4);
+  color-scheme: dark;
+}
