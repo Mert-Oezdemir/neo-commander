@@ -10,6 +10,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import { startServer, type RunningServer, type AuthLike, type TunnelLike } from '../server.js';
 import { textResult, type ToolDef } from '../tools/types.js';
+import { SessionManager } from './sessions.js';
 
 let dir: string;
 let srv: RunningServer;
@@ -56,7 +57,7 @@ before(async () => {
           (req as any).auth = { token: m[1], clientId: m[1].slice(3), scopes: [] };
           next();
         },
-        listClients: () => [], revokeClient() {}, revokeAll() {}, onPublicUrlChanged() {},
+        listClients: () => [], revokeClient() {}, revokeAll() {}, clearPinLockout() {}, isPinLocked: () => false, onPublicUrlChanged() {},
       }),
       ownTools: [fakeTool, bigTool, boomTool],
       tunnel: () => Object.assign(new EventEmitter(), {
@@ -174,3 +175,15 @@ test('session cap evicts LRU, idle sweep removes', async () => {
 
 import * as fs from 'node:fs';
 function require_fs() { return fs; }
+
+test('session handler never echoes exception text to the client', async () => {
+  const sm = new SessionManager({ router: {} as any, version: '0' });
+  let out: { status?: number; body?: any } = {};
+  const res: any = { headersSent: false, status(c: number) { out.status = c; return this; }, json(b: unknown) { out.body = b; return this; } };
+  const req: any = { auth: { clientId: 'c' }, header() { throw new Error('ENOENT: C:\\Users\\secret\\file'); } };
+  const orig = console.error; console.error = () => {};
+  try { await sm.handle(req, res); } finally { console.error = orig; await sm.closeAll(); }
+  assert.equal(out.status, 500);
+  assert.equal(out.body.error.message, 'Internal error');
+  assert.ok(!JSON.stringify(out.body).includes('secret'));
+});

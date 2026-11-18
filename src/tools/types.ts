@@ -20,6 +20,12 @@ export interface ToolDef {
   risk: Risk;
   /** Names of arguments that are file-system paths (checked against allowedDirectories). */
   pathArgs?: string[];
+  /**
+   * Names of arguments that are command-line text (strings or string arrays). PolicyEngine runs them through
+   * the command guard; the FIRST one is additionally path-checked (allowedDirectories + protected state dir)
+   * when it looks like a filesystem path (drive letter, UNC, ./ or /, backslash) - URLs and app names pass.
+   */
+  commandArgs?: string[];
   annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; openWorldHint?: boolean; title?: string };
   handler(args: Record<string, unknown>, ctx: ToolContext): Promise<CallToolResult>;
 }

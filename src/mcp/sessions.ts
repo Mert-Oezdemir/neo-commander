@@ -120,7 +120,9 @@ export class SessionManager {
 
       rpcError(res, 400, -32000, 'Bad Request: missing Mcp-Session-Id header (send initialize first)');
     } catch (e) {
-      rpcError(res, 500, -32603, `Internal error: ${(e as Error).message}`);
+      // Never echo exception text to the client (paths, internals); keep the detail in the server log.
+      console.error('[mcp] session handler error:', e);
+      rpcError(res, 500, -32603, 'Internal error');
     }
   };
 

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { DEFAULT_SETTINGS, type Settings } from '../config.js';
 import { AuditLog, PolicyEngine, RateLimiter, isInsideAny } from './index.js';
 import type { ToolMeta } from './index.js';
+import { checkCommand } from './commands.js';
 
 function mk(over: Partial<Settings> = {}, protectedPaths: string[] = []) {
   const s: Settings = { ...DEFAULT_SETTINGS, ...over };
@@ -261,4 +262,151 @@ test('AuditLog: rotates at 5 MB keeping 3 files; ring capped at 500', () => {
     assert.equal(a.recent(1000).length, 500);
     assert.equal(a.recent(1)[0].tool, 't599');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ---- real-path (symlink / junction) resolution ------------------------------------------------
+
+function fsFixture() {
+  const parent = mkdtempSync(join(tmpdir(), 'neo-pol-'));
+  const state = join(parent, 'NeoCommander');
+  const work = join(parent, 'work');
+  mkdirSync(state); mkdirSync(work);
+  writeFileSync(join(state, 'secrets.json'), '{}');
+  writeFileSync(join(work, 'a.txt'), 'x');
+  symlinkSync(parent, join(parent, 'Local Settings')); // like the Windows "Local Settings" junction
+  symlinkSync(state, join(work, 'stateLink'));
+  symlinkSync(join(parent, 'does-not-exist-yet'), join(work, 'dangling'));
+  symlinkSync(parent, join(work, 'outLink'));
+  return { parent, state, work, cleanup: () => rmSync(parent, { recursive: true, force: true }) };
+}
+
+test('protected paths are resolved through symlinks/junctions (existing and not-yet-existing files)', () => {
+  const f = fsFixture();
+  try {
+    const { p } = mk({}, [f.state]);
+    no(p.check(eng(p, 'read_file'), { path: join(f.state, 'secrets.json') }, 'c'));
+    no(p.check(eng(p, 'read_file'), { path: join(f.parent, 'Local Settings', 'NeoCommander', 'secrets.json') }, 'c'));
+    no(p.check(eng(p, 'read_file'), { path: join(f.work, 'stateLink', 'secrets.json') }, 'c'));
+    no(p.check(eng(p, 'write_file'), { path: join(f.work, 'stateLink', 'new-file.txt'), content: '' }, 'c')); // does not exist yet
+    no(p.check(eng(p, 'write_file'), { path: join(f.work, 'stateLink', 'a', 'b', 'c.txt'), content: '' }, 'c'));
+    no(p.check(eng(p, 'read_file'), { path: join(f.work, 'outLink', 'NeoCommander', '..', 'NeoCommander', 'secrets.json') }, 'c'));
+    no(p.check(eng(p, 'read_file'), { path: join(f.state, 'x', '..', 'secrets.json') }, 'c'));
+    ok(p.check(eng(p, 'read_file'), { path: join(f.work, 'a.txt') }, 'c'));
+    ok(p.check(eng(p, 'write_file'), { path: join(f.work, 'brand-new.txt'), content: '' }, 'c'));
+    // the protected path itself may be given through a link
+    const viaLink = mk({}, [join(f.parent, 'Local Settings', 'NeoCommander')]);
+    no(viaLink.p.check(eng(viaLink.p, 'read_file'), { path: join(f.state, 'secrets.json') }, 'c'));
+  } finally { f.cleanup(); }
+});
+
+test('allowedDirectories: a link inside an allowed dir cannot lead out of it; allowed dir may itself be a link', () => {
+  const f = fsFixture();
+  try {
+    const { p } = mk({ allowedDirectories: [f.work] });
+    ok(p.check(eng(p, 'read_file'), { path: join(f.work, 'a.txt') }, 'c'));
+    ok(p.check(eng(p, 'write_file'), { path: join(f.work, 'new.txt'), content: '' }, 'c'));
+    no(p.check(eng(p, 'read_file'), { path: join(f.work, 'outLink', 'NeoCommander', 'secrets.json') }, 'c'));
+    no(p.check(eng(p, 'write_file'), { path: join(f.work, 'outLink', 'evil.txt'), content: '' }, 'c'));
+    no(p.check(eng(p, 'write_file'), { path: join(f.work, 'dangling', 'x'), content: '' }, 'c'));
+    const viaLink = mk({ allowedDirectories: [join(f.parent, 'Local Settings', 'work')] });
+    ok(viaLink.p.check(eng(viaLink.p, 'read_file'), { path: join(f.parent, 'Local Settings', 'work', 'a.txt') }, 'c'));
+    no(viaLink.p.check(eng(viaLink.p, 'read_file'), { path: join(f.parent, 'Local Settings', 'NeoCommander', 'secrets.json') }, 'c'));
+  } finally { f.cleanup(); }
+});
+
+test('recursive tools (start_search, list_directory) cannot be rooted at an ancestor of the state dir', () => {
+  const f = fsFixture();
+  try {
+    const { p } = mk({ mode: 'readonly' }, [f.state]);
+    no(p.check(eng(p, 'start_search'), { path: f.state, pattern: 'x' }, 'c')); // the state dir itself: plain protected-path denial
+    for (const root of [f.parent, join(f.parent, 'Local Settings'), join(f.work, 'outLink'), f.parent + '/./work/..']) {
+      const d = p.check(eng(p, 'start_search'), { path: root, pattern: 'signingKey', searchType: 'content' }, 'c');
+      no(d);
+      assert.match((d as { reason: string }).reason, /narrower folder/);
+      no(p.check(eng(p, 'list_directory'), { path: root }, 'c')); // upstream default depth 2
+      no(p.check(eng(p, 'list_directory'), { path: root, depth: 3 }, 'c'));
+    }
+    ok(p.check(eng(p, 'start_search'), { path: f.work, pattern: 'x', searchType: 'content' }, 'c'));
+    ok(p.check(eng(p, 'list_directory'), { path: f.work }, 'c'));
+    ok(p.check(eng(p, 'list_directory'), { path: f.parent, depth: 1 }, 'c')); // names only, no recursion into the state dir
+    ok(p.check(eng(p, 'get_more_search_results'), { sessionId: 'x' }, 'c'));
+    // windows-style (lexical) flavour stays testable on Linux
+    const w = mk({}, ['C:\\Users\\me\\AppData\\Local\\NeoCommander']);
+    no(w.p.check(eng(w.p, 'start_search'), { path: 'C:\\Users\\me', pattern: 'x' }, 'c'));
+    no(w.p.check(eng(w.p, 'start_search'), { path: 'c:\\', pattern: 'x' }, 'c'));
+    ok(w.p.check(eng(w.p, 'start_search'), { path: 'C:\\Users\\me\\Documents', pattern: 'x' }, 'c'));
+  } finally { f.cleanup(); }
+});
+
+// ---- command guard: size cap, linear time, indirect state-dir references ---------------------------
+
+test('commands: > 32 KB refused (also via interact_with_process); 32 KB adversarial input is fast', () => {
+  const { p } = mk({}, ['/x']);
+  assert.match(checkCommand('a'.repeat(32 * 1024 + 1), { protectedPaths: [] }) ?? '', /32 KB/);
+  no(p.check(eng(p, 'start_process'), { command: 'echo ' + 'a'.repeat(33 * 1024) }, 'c'));
+  no(p.check(eng(p, 'interact_with_process'), { pid: 1, input: 'a'.repeat(33 * 1024) }, 'c'));
+  ok(p.check(eng(p, 'start_process'), { command: 'echo hi' }, 'c'));
+  const n = 32 * 1024;
+  const adversarial = [
+    'rm -r '.repeat(Math.floor(n / 6)), 'rm -rf / '.repeat(Math.floor(n / 9)), 'rm '.repeat(Math.floor(n / 3)) + '-r',
+    'format ' + '/ '.repeat(n / 2 - 4), 'cipher ' + '/a '.repeat(n / 3 - 3), ' i'.repeat(n / 2), 'iex'.repeat(n / 3),
+    'powershell ' + '-e '.repeat(n / 3 - 4), ';'.repeat(n), ' '.repeat(n - 1) + 'x', 'start '.repeat(n / 6), '*'.repeat(n), 'a*'.repeat(n / 2),
+  ];
+  for (const cmd of adversarial) {
+    assert.ok(cmd.length <= n, `fixture too long: ${cmd.slice(0, 20)}`);
+    const t = performance.now();
+    checkCommand(cmd, { protectedPaths: ['/x', 'C:\\a\\b'] });
+    const ms = performance.now() - t;
+    assert.ok(ms < 50, `${cmd.slice(0, 20)}... took ${ms.toFixed(1)} ms`);
+  }
+});
+
+test('commands: dangerousRemoval still catches the same things after the rewrite', () => {
+  const cp = { protectedPaths: [] as string[] };
+  assert.ok(checkCommand('rm -rf /', cp));
+  assert.ok(checkCommand('Remove-Item -Recurse -Force C:\\', cp));
+  assert.ok(checkCommand('echo hi; rd /s /q C:\\Windows', cp));
+  assert.ok(checkCommand('del /s %USERPROFILE%', cp));
+  assert.ok(checkCommand('rm -r ~', cp));
+  assert.equal(checkCommand('rm -rf ./build', cp), undefined);
+  assert.equal(checkCommand('rm file.txt /', cp), undefined); // not recursive
+  assert.equal(checkCommand('ls -r /; rm x', cp), undefined); // flag and target belong to other commands
+});
+
+test('commands: indirect references to the state dir (env vars, 8.3 alias, wildcards)', () => {
+  const cp = { protectedPaths: ['C:\\Users\\me\\AppData\\Local\\NeoCommander'] };
+  for (const c of [
+    'type %LOCALAPPDATA%\\NeoCommander\\secrets.json',
+    'type "$env:LOCALAPPDATA\\NeoCommander\\secrets.json"',
+    "Get-Content (Join-Path $env:LOCALAPPDATA 'NeoCommander' | Join-Path -ChildPath secrets.json)",
+    'type %LOCALAPPDATA%\\Neo*Comm*\\secrets.json',
+    'cat ~/.neo*/secrets.json', 'type C:\\Users\\me\\AppData\\Local\\NEOCOM~1\\secrets.json',
+    'type %LOCALAPPDATA%\\N?oC*r\\secrets.json', 'dir $env:LOCALAPPDATA\\Ne[o]Commander',
+  ]) assert.ok(checkCommand(c, cp), c);
+  for (const c of ['ls *', 'rm *.txt', 'dir C:\\Work\\n*', 'echo Neo is nice', 'cat src/neo-commander.ts', 'find . -name "*er"'])
+    assert.equal(checkCommand(c, { protectedPaths: [] }), undefined, c);
+});
+
+// ---- own tools whose args are command text (desktop_open) --------------------------------------------
+
+test('desktop_open style tools: target+args go through the command guard and, for path-like targets, the path guard', () => {
+  const prot = 'C:\\Users\\me\\AppData\\Local\\NeoCommander';
+  const { p } = mk({ allowedDirectories: ['C:\\Work'] }, [prot]);
+  const open: ToolMeta = { name: 'desktop_open', risk: 'exec', pathArgs: [], source: 'own', commandArgs: ['target', 'args'] };
+  ok(p.check(open, { target: 'https://example.com/a?b=c' }, 'c'));
+  ok(p.check(open, { target: 'notepad' }, 'c'));
+  ok(p.check(open, { target: 'notepad', args: ['C:\\Work\\a.txt'] }, 'c'));
+  ok(p.check(open, { target: 'C:\\Work\\app.exe' }, 'c'));
+  no(p.check(open, { target: prot + '\\secrets.json' }, 'c'));
+  no(p.check(open, { target: 'notepad', args: [prot + '\\secrets.json'] }, 'c'));
+  no(p.check(open, { target: 'notepad', args: '%LOCALAPPDATA%\\NeoCommander\\oauth.json' }, 'c'));
+  no(p.check(open, { target: 'C:\\Windows\\System32\\cmd.exe' }, 'c')); // outside allowedDirectories
+  no(p.check(open, { target: '\\\\srv\\share\\x.exe' }, 'c'));
+  no(p.check(open, { target: '..\\..\\x.exe' }, 'c'));
+  no(p.check(open, { target: 'cmd', args: ['/c', 'format c:'] }, 'c'));
+  no(p.check(open, { target: 'powershell', args: ['-e', 'A'.repeat(40)] }, 'c'));
+  no(p.check(open, { target: 'x', args: ['a'.repeat(33 * 1024)] }, 'c'));
+  const free = mk({}, [prot]);
+  ok(free.p.check(open, { target: 'C:\\Windows\\notepad.exe' }, 'c'));
+  no(free.p.check(open, { target: prot }, 'c'));
 });

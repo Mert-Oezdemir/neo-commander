@@ -67,6 +67,7 @@
     $('quick-warning').hidden = !(t.kind === 'cloudflare-quick' && t.state === 'online');
     $('pin-box').textContent = pinShown ? s.pin : '••••-••••-••••-••••';
     $('toggle-pin').textContent = pinShown ? 'Gizle' : 'Göster';
+    $('unlock-pin').hidden = !s.pinLocked;
 
     // kill
     var k = $('kill');
@@ -169,6 +170,9 @@
   $('regen-pin').onclick = function () {
     if (!confirm('PIN yenilensin mi? Yeni bağlantılar yeni PIN\'i girmek zorunda kalır.')) return;
     api('POST', '/pin/regenerate').then(function (j) { state.pin = j.pin; render(); toast('PIN yenilendi'); }).catch(fail);
+  };
+  $('unlock-pin').onclick = function () {
+    api('POST', '/pin/unlock').then(function () { state.pinLocked = false; render(); toast('PIN kilidi açıldı'); }).catch(fail);
   };
   $('kill').onclick = function () { post('/settings', { paused: !state.paused }); };
   document.querySelectorAll('input[name=mode]').forEach(function (r) { r.onchange = function () { post('/settings', { mode: r.value }); }; });

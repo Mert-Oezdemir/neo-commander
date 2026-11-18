@@ -3,7 +3,10 @@ import type { Risk, ToolDef } from '../tools/types.js';
 import { textResult } from '../tools/types.js';
 
 // Structural views of the policy/engine modules so this file does not depend on their internals.
-export interface ToolMetaLike { name: string; risk: Risk; pathArgs: string[]; source: 'engine' | 'own' }
+export interface ToolMetaLike {
+  name: string; risk: Risk; pathArgs: string[]; source: 'engine' | 'own';
+  recursiveArgs?: string[]; commandArgs?: string[];
+}
 export type DecisionLike = { ok: true; args: Record<string, unknown> } | { ok: false; reason: string };
 export interface PolicyLike {
   engineToolMeta(name: string, inputSchema?: unknown): ToolMetaLike;
@@ -72,7 +75,7 @@ export class ToolRouter {
     }
     for (const own of this.ownByName.values()) {
       if (out.has(own.name)) throw new Error(`Tool name collision between engine and own tool: ${own.name}`);
-      out.set(own.name, { meta: { name: own.name, risk: own.risk, pathArgs: own.pathArgs ?? [], source: 'own' }, own });
+      out.set(own.name, { meta: { name: own.name, risk: own.risk, pathArgs: own.pathArgs ?? [], source: 'own', ...(own.commandArgs ? { commandArgs: own.commandArgs } : {}) }, own });
     }
     return out;
   }

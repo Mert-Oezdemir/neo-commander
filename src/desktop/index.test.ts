@@ -61,6 +61,13 @@ describe('tool definitions', () => {
   });
 });
 
+describe('desktop_open policy flags', () => {
+  it('declares target+args as command text so PolicyEngine guards them', () => {
+    const open = desktopTools().find((t) => t.name === 'desktop_open')!;
+    assert.deepEqual(open.commandArgs, ['target', 'args']);
+  });
+});
+
 describe('non-Windows', () => {
   it('every handler returns the Windows-only error', async () => {
     hooks.isWindows = () => false;

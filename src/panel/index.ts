@@ -20,6 +20,8 @@ export interface PanelDeps {
     listClients(): { clientId: string; clientName: string; createdAt: number; lastUsedAt?: number }[];
     revokeClient(id: string): void;
     revokeAll(): void;
+    clearPinLockout(): void;
+    isPinLocked(): boolean;
   };
   audit: EventEmitter & { recent(limit?: number): any[] };
   engineStatus(): { state: 'starting' | 'ready' | 'error'; toolCount: number; message?: string };
@@ -110,6 +112,7 @@ export function createPanelRouter(deps: PanelDeps): Router {
       tunnel: t,
       connectorUrl: url ? `${url}/mcp` : null,
       pin: deps.getSecrets().ownerPin,
+      pinLocked: deps.auth.isPinLocked(),
       mode: s.mode,
       paused: s.paused,
       allowedDirectories: s.allowedDirectories,
@@ -193,6 +196,8 @@ export function createPanelRouter(deps: PanelDeps): Router {
     const s = deps.regeneratePin();
     res.json({ ok: true, pin: s.ownerPin });
   });
+  // Owner-side escape hatch for the global PIN-failure cap (same loopback + CSRF guards as every POST here).
+  api.post('/pin/unlock', (_req, res) => { deps.auth.clearPinLockout(); res.json({ ok: true, pinLocked: deps.auth.isPinLocked() }); });
   api.post('/clients/revoke-all', (_req, res) => { deps.auth.revokeAll(); res.json({ ok: true, clients: deps.auth.listClients() }); });
   api.post('/clients/:id/revoke', (req, res) => { deps.auth.revokeClient(String(req.params.id)); res.json({ ok: true, clients: deps.auth.listClients() }); });
   api.post('/tunnel/restart', (_req, res) => { void deps.tunnel.start().catch(() => undefined); res.json({ ok: true }); });

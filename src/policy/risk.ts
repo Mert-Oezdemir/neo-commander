@@ -28,6 +28,9 @@ export const ENGINE_PATH_ARGS: Record<string, string[]> = {
   move_file: ['source', 'destination'], write_pdf: ['path', 'sourcePdfPath', 'outputPath'],
 };
 
+/** Engine tools that recurse below their path argument (denied when it would reach the state dir). */
+export const ENGINE_RECURSIVE_ARGS: Record<string, string[]> = { start_search: ['path'], list_directory: ['path'] };
+
 const PATHISH = /^(path|paths|source|destination|directory|dir|cwd|outputPath|file|files|file_path|filePath|filepath|.*_path|.*Path|.*Paths|.*_dir|.*Dir|.*Directory)$/;
 
 export function heuristicPathArgs(inputSchema: unknown): string[] {

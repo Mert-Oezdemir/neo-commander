@@ -352,6 +352,8 @@ export function desktopTools(): ToolDef[] {
       },
       required: ['target'],
     },
+    // target + args are command text (checkCommand); a path-looking target is also path-checked by the policy.
+    commandArgs: ['target', 'args'],
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, title: 'Open' },
     async run(args, ctx) {
       return json(await ps(SCRIPT_OPEN, parseOpen(args), ctx));

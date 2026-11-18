@@ -33,6 +33,8 @@ export interface AuthLike {
   listClients(): { clientId: string; clientName: string; createdAt: number; lastUsedAt?: number }[];
   revokeClient(id: string): void;
   revokeAll(): void;
+  clearPinLockout(): void;
+  isPinLocked(): boolean;
   onPublicUrlChanged(): void;
 }
 export interface TunnelLike extends EventEmitter {

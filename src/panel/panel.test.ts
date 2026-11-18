@@ -24,6 +24,7 @@ const tunnel = Object.assign(new EventEmitter(), {
 }) as unknown as TunnelManager;
 let tunnelStarts = 0;
 let revoked: string[] = [];
+let locked = true;
 
 before(async () => {
   const app = express();
@@ -33,7 +34,7 @@ before(async () => {
     getSecrets: () => ({ signingKey: 'k', ownerPin: pin }),
     regeneratePin: () => { pin = 'ZZZZ-YYYY-XXXX-WWWW'; return { signingKey: 'k', ownerPin: pin }; },
     tunnel,
-    auth: { listClients: () => [{ clientId: 'c1', clientName: 'Claude', createdAt: 1 }], revokeClient: (id) => { revoked.push(id); }, revokeAll: () => { revoked.push('*'); } },
+    auth: { listClients: () => [{ clientId: 'c1', clientName: 'Claude', createdAt: 1 }], revokeClient: (id) => { revoked.push(id); }, revokeAll: () => { revoked.push('*'); }, clearPinLockout: () => { revoked.push('unlock'); locked = false; }, isPinLocked: () => locked },
     audit,
     engineStatus: () => ({ state: 'ready', toolCount: 42 }),
     version: '0.1.0',
@@ -185,4 +186,16 @@ test('autostart: windows startup file written/removed; other OS unsupported', ()
   assert.equal(setAutostart(false, app, { platform: 'win32', startupDir: startup }).ok, true);
   assert.equal(existsSync(f), false);
   assert.equal(setAutostart(true, 'C:\\evil" & calc', { platform: 'win32', startupDir: startup }).ok, false);
+});
+
+test('POST /pin/unlock: needs CSRF, clears the lockout, state reports pinLocked', async () => {
+  locked = true;
+  const st = JSON.parse((await req('GET', '/panel/api/state')).body);
+  assert.equal(st.pinLocked, true);
+  assert.equal((await req('POST', '/panel/api/pin/unlock', { body: {} })).status, 403); // no CSRF token
+  assert.equal((await req('POST', '/panel/api/pin/unlock', { body: {}, host: 'evil.test', headers: { 'x-neo-csrf': await csrf() } })).status, 404); // not direct loopback
+  const r = await req('POST', '/panel/api/pin/unlock', { body: {}, headers: { 'x-neo-csrf': await csrf() } });
+  assert.equal(r.status, 200);
+  assert.ok(revoked.includes('unlock'));
+  assert.equal(JSON.parse((await req('GET', '/panel/api/state')).body).pinLocked, false);
 });

@@ -38,34 +38,83 @@ const DANGEROUS_TARGET: RegExp[] = [
   /^\$home\/?\*?$/i,
 ];
 
+/**
+ * Single linear pass per segment (was O(n^2): each rm token re-sliced/re-scanned the rest of the line).
+ * Scanning right-to-left we keep two booleans for "everything after this token": is there a recursive
+ * flag, is there a dangerous target. An rm-like token is a hit when both hold for its remainder.
+ */
 function dangerousRemoval(cmd: string): string | undefined {
+  const isFlag = (t: string) => /^-{1,2}[a-zA-Z][\w-]*$/.test(t) || /^\/[a-zA-Z]$/.test(t);
   for (const seg of cmd.split(/[;&|\n\r]+/)) {
     const tokens = seg.replace(/["'`]/g, ' ').trim().split(/\s+/).filter(Boolean);
-    for (let i = 0; i < tokens.length; i++) {
-      const name = tokens[i].toLowerCase().replace(/^.*[\\/]/, '').replace(/\.exe$/, '');
-      if (!RM_NAMES.has(name)) continue;
-      const rest = tokens.slice(i + 1);
-      const isFlag = (t: string) => /^-{1,2}[a-zA-Z][\w-]*$/.test(t) || /^\/[a-zA-Z]$/.test(t);
-      if (!rest.filter(isFlag).some(RECURSIVE)) continue;
-      for (const t of rest) {
-        if (isFlag(t)) continue;
+    let restRecursive = false;
+    let restDangerous = false;
+    for (let i = tokens.length - 1; i >= 0; i--) {
+      const t = tokens[i]!;
+      const name = t.toLowerCase().replace(/^.*[\\/]/, '').replace(/\.exe$/, '');
+      if (RM_NAMES.has(name) && restRecursive && restDangerous) return 'recursive delete of a drive root / system or home directory';
+      if (isFlag(t)) {
+        if (RECURSIVE(t)) restRecursive = true;
+      } else if (!restDangerous) {
         const cleaned = t.replace(/,$/, '').replace(/^-path:?/i, '');
         const win = /^[a-z]:/i.test(cleaned) ? cleaned.replace(/\//g, '\\') : cleaned;
-        if (DANGEROUS_TARGET.some((re) => re.test(win))) return 'recursive delete of a drive root / system or home directory';
+        if (DANGEROUS_TARGET.some((re) => re.test(win))) restDangerous = true;
       }
     }
   }
   return undefined;
 }
 
+/** Linear-time glob match (`*`, `?`, `[...]` treated as one char), case-insensitive. */
+function globMatches(pattern: string, text: string): boolean {
+  const pat = pattern.toLowerCase().replace(/\[[^\]]*\]/g, '?');
+  let p = 0, t = 0, star = -1, mark = 0;
+  while (t < text.length) {
+    if (p < pat.length && (pat[p] === '?' || pat[p] === text[t])) { p++; t++; }
+    else if (p < pat.length && pat[p] === '*') { star = p++; mark = t; }
+    else if (star >= 0) { p = star + 1; t = ++mark; }
+    else return false;
+  }
+  while (p < pat.length && pat[p] === '*') p++;
+  return p === pat.length;
+}
+
+const STATE_DIR_NAMES = ['neocommander', '.neo-commander'];
+
+/**
+ * Best-effort: does the command reference the state dir by %LOCALAPPDATA%\NeoCommander, a
+ * Join-Path style bare name, an 8.3 alias (NEOCOM~1) or a wildcard (Neo*Comm*, N?oC*)?
+ */
+function touchesStateDirIndirectly(cmd: string): boolean {
+  if (/neocommander/i.test(cmd) || /\bneocom~\d/i.test(cmd)) return true;
+  // each path segment of each token that is a glob able to expand to a state dir name (>= 3 literal chars,
+  // so "*", "*.txt" or "n*" do not trip it)
+  for (const tok of cmd.match(/[^\s"'`;|&()=,<>]+/g) ?? []) {
+    if (!/[*?[]/.test(tok)) continue;
+    for (const seg of tok.split(/[\\/]/)) {
+      if (seg.length > 64 || !/[*?[]/.test(seg)) continue;
+      if (seg.replace(/[*?]|\[[^\]]*\]/g, '').length < 3) continue;
+      if (STATE_DIR_NAMES.some((n) => globMatches(seg, n))) return true;
+    }
+  }
+  return false;
+}
+
+/** Commands / interact_with_process input above this are refused outright (bounds every scan below). */
+export const MAX_COMMAND_BYTES = 32 * 1024;
+
 export interface CommandGuardOptions { protectedPaths: string[] }
 
 /** Returns a denial reason, or undefined if the command looks acceptable. */
 export function checkCommand(cmd: string, opts: CommandGuardOptions): string | undefined {
+  if (cmd.length > MAX_COMMAND_BYTES || Buffer.byteLength(cmd, 'utf8') > MAX_COMMAND_BYTES) {
+    return 'command is longer than 32 KB; split it up or put it in a script file';
+  }
   if (/powershell|pwsh/i.test(cmd) && ENCODED.test(cmd)) return 'obfuscated PowerShell (-EncodedCommand)';
   for (const [re, why] of DENY_PATTERNS) if (re.test(cmd)) return why;
   const rm = dangerousRemoval(cmd);
   if (rm) return rm;
+  if (touchesStateDirIndirectly(cmd)) return "touches Neo Commander's own state directory";
   const loose = looseKey(cmd);
   if (/(?:\.neo-commander|[\\/]neocommander)(?:[\\/"'\s]|$)/i.test(cmd) || /\bNEO_HOME\b/.test(cmd)) {
     return "touches Neo Commander's own state directory";

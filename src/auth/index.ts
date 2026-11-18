@@ -11,13 +11,17 @@ import {
   InvalidClientMetadataError, InvalidGrantError, InvalidScopeError, InvalidTargetError, InvalidTokenError,
 } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type { OAuthClientInformationFull, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
-import { readJson, writeJsonAtomic } from '../config.js';
+import { readJson, saveSecrets, writeJsonAtomic } from '../config.js';
 import type { Secrets } from '../config.js';
 import { deriveKey, signBlob, signJwt, verifyBlob, verifyJwt } from './jwt.js';
 import { esc, renderConsent } from './consent.js';
 
 export interface AuthOptions {
   stateDir: string;
+  /**
+   * Mutable holder shared with the server (single source of truth). The signing key is ALWAYS read from
+   * `secrets.signingKey` at use time, because revokeAll() rotates it in place.
+   */
   secrets: Secrets;
   getPublicUrl(): string | undefined;
   port: number;
@@ -28,7 +32,11 @@ export interface Auth {
   requireAuth: express.RequestHandler;
   listClients(): ClientSummary[];
   revokeClient(clientId: string): void;
+  /** Bumps the generation, drops refresh tokens AND rotates the signing key (persisted). */
   revokeAll(): void;
+  /** Forget the in-memory global PIN-failure counter (panel "unlock" button). */
+  clearPinLockout(): void;
+  isPinLocked(): boolean;
   onPublicUrlChanged(): void;
 }
 
@@ -37,7 +45,12 @@ const REFRESH_TTL_MS = 30 * 24 * 3600 * 1000;
 const CODE_TTL_MS = 5 * 60 * 1000;
 const PENDING_TTL_MS = 10 * 60 * 1000;
 const PIN_WINDOW_MS = 10 * 60 * 1000;
-const PIN_MAX_FAILS = 5;
+/** Wrong PINs allowed per pending consent request; then that request is dead (start again from Claude). */
+const PIN_MAX_FAILS_PER_PENDING = 5;
+/** Global in-memory safety cap (never persisted, so a restart/panel unlock frees the owner). PIN is ~2^80 anyway. */
+const PIN_MAX_FAILS_GLOBAL = 30;
+/** Tolerated clock skew when validating iat / exp - iat of access tokens. */
+const TOKEN_SKEW_S = 60;
 const MAX_CLIENTS = 50;
 const SCOPE = 'mcp';
 
@@ -52,7 +65,6 @@ interface OAuthState {
   clients: Record<string, StoredClient>;
   refresh: Record<string, RefreshRecord>;
   revokedJti: Record<string, number>;
-  pinFailures: number[];
 }
 interface CodeRecord {
   clientId: string; redirectUri: string; challenge: string; resource: string; scope: string; gen: number; expiresAt: number;
@@ -88,11 +100,14 @@ export function createAuth(opts: AuthOptions): Auth {
     clients: loaded.clients ?? {},
     refresh: loaded.refresh ?? {},
     revokedJti: loaded.revokedJti ?? {},
-    pinFailures: Array.isArray(loaded.pinFailures) ? loaded.pinFailures : [],
   };
   const codes = new Map<string, CodeRecord>();
   const usedPending = new Map<string, number>();
-  const consentKey = deriveKey(opts.secrets.signingKey, 'neo-commander/consent/v1');
+  // Derived on use: the signing key rotates in revokeAll(), which also invalidates open consent pages.
+  const consentKey = (): string => deriveKey(opts.secrets.signingKey, 'neo-commander/consent/v1');
+  // PIN brute-force limits are memory-only by design (see PIN_MAX_FAILS_*).
+  let globalPinFailures: number[] = [];
+  const pendingFailures = new Map<string, { count: number; exp: number }>();
   let lastUsedSave = 0;
 
   const save = (): void => {
@@ -175,9 +190,10 @@ export function createAuth(opts: AuthOptions): Auth {
   // ---- PIN / lockout ----------------------------------------------------
   const pruneFailures = (): void => {
     const cutoff = Date.now() - PIN_WINDOW_MS;
-    state.pinFailures = state.pinFailures.filter((t) => t > cutoff);
+    globalPinFailures = globalPinFailures.filter((t) => t > cutoff);
+    for (const [n, f] of pendingFailures) if (f.exp < Date.now()) pendingFailures.delete(n);
   };
-  const isLocked = (): boolean => { pruneFailures(); return state.pinFailures.length >= PIN_MAX_FAILS; };
+  const isLocked = (): boolean => { pruneFailures(); return globalPinFailures.length >= PIN_MAX_FAILS_GLOBAL; };
   const checkPin = (input: string): boolean => {
     const a = sha256buf(normalizePin(input));
     const b = sha256buf(normalizePin(opts.secrets.ownerPin));
@@ -209,7 +225,7 @@ export function createAuth(opts: AuthOptions): Auth {
     sendHtml(res, locked ? 429 : status, nonce, origin, renderConsent({
       clientName: clientName(client), redirectHost: host, pending: pendingToken, nonce, scope: p.sc,
       locked,
-      error: locked ? 'Çok fazla hatalı PIN denemesi. Güvenlik için 10 dakika boyunca yeni deneme kabul edilmiyor.' : error,
+      error: locked ? 'Çok fazla hatalı PIN denemesi. Güvenlik için bir süre yeni deneme kabul edilmiyor (Neo Commander panelinden kilit açılabilir).' : error,
     }));
   }
 
@@ -226,7 +242,7 @@ export function createAuth(opts: AuthOptions): Auth {
         cid: client.client_id, ru: params.redirectUri, cc: params.codeChallenge, st: params.state, sc: scope,
         rs: resourceUrl(), exp: Date.now() + PENDING_TTL_MS, n: randomBytes(12).toString('base64url'),
       };
-      renderPage(res, client, p, signBlob(p, consentKey));
+      renderPage(res, client, p, signBlob(p, consentKey()));
     },
 
     async challengeForAuthorizationCode(_client, code) {
@@ -268,6 +284,9 @@ export function createAuth(opts: AuthOptions): Auth {
       const c = verifyJwt(token, opts.secrets.signingKey);
       if (!c) throw new InvalidTokenError('Invalid token');
       if (c.exp * 1000 <= Date.now()) throw new InvalidTokenError('Token has expired');
+      // Defence in depth against forged long-lived tokens (e.g. exp = +10 years): we only ever issue ACCESS_TTL_S tokens.
+      if (c.exp - c.iat > ACCESS_TTL_S + TOKEN_SKEW_S) throw new InvalidTokenError('Token lifetime is too long');
+      if (c.iat > Date.now() / 1000 + TOKEN_SKEW_S) throw new InvalidTokenError('Token issued in the future');
       if (c.gen !== state.generation) throw new InvalidTokenError('Token has been revoked');
       if (state.revokedJti[c.jti]) throw new InvalidTokenError('Token has been revoked');
       if (!sameResource(c.iss, baseUrl()) || !sameResource(c.aud, resourceUrl())) throw new InvalidTokenError('Token was not issued by this server');
@@ -294,7 +313,7 @@ export function createAuth(opts: AuthOptions): Auth {
   const decision: RequestHandler = (req: Request, res: Response) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const pendingToken = typeof body.pending === 'string' ? body.pending : '';
-    const p = verifyBlob<Pending>(pendingToken, consentKey);
+    const p = verifyBlob<Pending>(pendingToken, consentKey());
     const fail = (msg: string): void => {
       sendHtml(res, 400, randomBytes(16).toString('base64url'), undefined,
         `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Neo Commander</title><p style="font-family:system-ui;padding:24px">${esc(msg)}</p>`);
@@ -315,16 +334,25 @@ export function createAuth(opts: AuthOptions): Auth {
 
     if (body.decision === 'deny') return redirectBack({ error: 'access_denied', error_description: 'The owner denied the request' });
     if (body.decision !== 'allow') return fail('Geçersiz istek.');
-    if (usedPending.has(p.n)) return fail('Bu istek zaten kullanıldı. Lütfen bağlantıyı yeniden başlatın.');
+    if (usedPending.has(p.n)) return fail('Bu istek zaten kullanıldı veya iptal edildi. Lütfen bağlantıyı Claude\'dan yeniden başlatın.');
 
     if (isLocked()) return renderPage(res, client, p, pendingToken);
     const pin = typeof body.pin === 'string' ? body.pin.slice(0, 100) : '';
     if (!checkPin(pin)) {
-      state.pinFailures.push(Date.now());
-      save();
-      const left = Math.max(0, PIN_MAX_FAILS - state.pinFailures.length);
+      globalPinFailures.push(Date.now());
+      const f = pendingFailures.get(p.n) ?? { count: 0, exp: p.exp };
+      f.count += 1;
+      pendingFailures.set(p.n, f);
+      if (f.count >= PIN_MAX_FAILS_PER_PENDING) {
+        // This consent request is dead; a fresh one has to be started from Claude. Other requests are unaffected.
+        usedPending.set(p.n, p.exp);
+        pendingFailures.delete(p.n);
+        return fail('Çok fazla hatalı PIN denemesi; bu istek iptal edildi. Lütfen bağlantıyı Claude\'dan yeniden başlatın.');
+      }
+      const left = PIN_MAX_FAILS_PER_PENDING - f.count;
       return renderPage(res, client, p, pendingToken, `PIN hatalı. Kalan deneme: ${left}.`, 401);
     }
+    pendingFailures.delete(p.n);
     usedPending.set(p.n, p.exp);
     for (const [n, exp] of usedPending) if (exp < Date.now()) usedPending.delete(n);
 
@@ -349,6 +377,28 @@ export function createAuth(opts: AuthOptions): Auth {
   // ---- lazily built SDK routers, keyed by public URL --------------------
   const routers = new Map<string, RequestHandler>();
   const noLimit = { validate: false } as const;
+  // Behind a tunnel every request arrives from 127.0.0.1, so key limiters on the real client address
+  // (set by the tunnel edge: Cloudflare / Tailscale Funnel); the LAST x-forwarded-for hop is the one our proxy appended.
+  const hdr = (req: Request, name: string): string | undefined => {
+    const v = req.headers[name];
+    const x = Array.isArray(v) ? v[v.length - 1] : v;
+    return typeof x === 'string' && x.trim() ? x.trim().slice(0, 128) : undefined;
+  };
+  const keyGenerator = (req: Request): string => {
+    const cf = hdr(req, 'cf-connecting-ip');
+    if (cf) return `cf:${cf}`;
+    const ts = hdr(req, 'tailscale-user-login');
+    if (ts) return `ts:${ts}`;
+    const xff = hdr(req, 'x-forwarded-for');
+    if (xff) return `xff:${xff.split(',').pop()!.trim()}`;
+    return `ip:${req.ip ?? 'unknown'}`;
+  };
+  // A refresh request carrying a refresh token we actually hold must never be starved by an attacker's flood.
+  const skipKnownRefresh = (req: Request): boolean => {
+    const b = req.body as Record<string, unknown> | undefined;
+    return b?.grant_type === 'refresh_token' && typeof b.refresh_token === 'string' && b.refresh_token.length <= 256 &&
+      state.refresh[sha256b64(b.refresh_token)] !== undefined;
+  };
   function routerFor(base: string): RequestHandler {
     let r = routers.get(base);
     if (!r) {
@@ -358,10 +408,10 @@ export function createAuth(opts: AuthOptions): Auth {
         resourceServerUrl: new URL(`${base}/mcp`),
         resourceName: 'Neo Commander',
         scopesSupported: [SCOPE],
-        authorizationOptions: { rateLimit: { ...noLimit, windowMs: 15 * 60 * 1000, limit: 200, max: 200 } },
-        tokenOptions: { rateLimit: { ...noLimit, windowMs: 15 * 60 * 1000, limit: 300, max: 300 } },
-        revocationOptions: { rateLimit: { ...noLimit, windowMs: 15 * 60 * 1000, limit: 100, max: 100 } },
-        clientRegistrationOptions: { clientSecretExpirySeconds: 0, rateLimit: { ...noLimit, windowMs: 60 * 60 * 1000, limit: 60, max: 60 } },
+        authorizationOptions: { rateLimit: { ...noLimit, keyGenerator, windowMs: 15 * 60 * 1000, limit: 200, max: 200 } },
+        tokenOptions: { rateLimit: { ...noLimit, keyGenerator, skip: skipKnownRefresh, windowMs: 15 * 60 * 1000, limit: 300, max: 300 } },
+        revocationOptions: { rateLimit: { ...noLimit, keyGenerator, windowMs: 15 * 60 * 1000, limit: 100, max: 100 } },
+        clientRegistrationOptions: { clientSecretExpirySeconds: 0, rateLimit: { ...noLimit, keyGenerator, windowMs: 60 * 60 * 1000, limit: 60, max: 60 } },
       });
       routers.set(base, r);
     }
@@ -421,12 +471,18 @@ export function createAuth(opts: AuthOptions): Auth {
     },
     revokeClient(clientId) { dropClient(clientId); save(); },
     revokeAll() {
+      // Rotate the signing key too: a leaked key must not survive "revoke all". Mutate the shared holder
+      // (server.getSecrets returns the same object) and persist before bumping state.
+      opts.secrets.signingKey = randomBytes(48).toString('base64url');
+      saveSecrets(opts.secrets, opts.stateDir);
       state.generation += 1;
       state.refresh = {};
       state.revokedJti = {};
       codes.clear();
       save();
     },
+    clearPinLockout() { globalPinFailures = []; },
+    isPinLocked: isLocked,
     onPublicUrlChanged: prune,
   };
 }

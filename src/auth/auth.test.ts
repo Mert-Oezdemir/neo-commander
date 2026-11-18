@@ -365,34 +365,120 @@ describe('OAuth full flow', () => {
   });
 });
 
-describe('PIN lockout', () => {
+describe('PIN limits (per pending request + global in-memory cap)', () => {
   let h: Harness;
   before(async () => { h = await start(); });
   after(async () => { await h.close(); rmSync(h.dir, { recursive: true, force: true }); });
 
-  test('5 wrong PINs lock out, even the correct one; persists across restart', async () => {
+  const newPending = async (): Promise<{ pending: string; clientId: string; challenge: string }> => {
     const reg = await (await register(h)).json() as any;
     const { challenge } = pkce();
     const { pending } = await getPending(h, authorizeUrl(h, reg.client_id, challenge));
-    for (let i = 0; i < 5; i++) assert.equal((await decide(h, pending, `bad-${i}`)).status, i === 4 ? 429 : 401);
-    const locked = await decide(h, pending, PIN);
-    assert.equal(locked.status, 429);
-    assert.equal(locked.headers.get('location'), null);
-    assert.ok((await locked.text()).includes('Çok fazla hatalı PIN'));
-    // GET page shows lockout, no form
-    const page = await getPending(h, authorizeUrl(h, reg.client_id, challenge));
+    return { pending, clientId: reg.client_id, challenge };
+  };
+
+  test('5 wrong PINs kill only that pending request; the owner can start a fresh one', async () => {
+    const a = await newPending();
+    for (let i = 0; i < 4; i++) assert.equal((await decide(h, a.pending, `bad-${i}`)).status, 401);
+    const dead = await decide(h, a.pending, 'bad-4');
+    assert.equal(dead.status, 400);
+    assert.ok((await dead.text()).includes('yeniden başlatın'));
+    // even the right PIN no longer works on the dead request
+    const after = await decide(h, a.pending, PIN);
+    assert.equal(after.status, 400);
+    assert.equal(after.headers.get('location'), null);
+    // a fresh request is not locked out and the correct PIN works
+    assert.equal(h.auth.isPinLocked(), false);
+    const b = await newPending();
+    const ok = await decide(h, b.pending, PIN);
+    assert.equal(ok.status, 303);
+    assert.ok(new URL(ok.headers.get('location')!).searchParams.get('code'));
+  });
+
+  test('failures are not persisted (oauth.json has no pinFailures; restart is clean)', async () => {
+    const state = JSON.parse(readFileSync(join(h.dir, 'oauth.json'), 'utf8'));
+    assert.equal(state.pinFailures, undefined);
+  });
+
+  test('global cap of 30 failures locks everything until clearPinLockout()', async () => {
+    h.auth.clearPinLockout();
+    for (let k = 0; k < 6; k++) {
+      const x = await newPending();
+      for (let i = 0; i < 5; i++) await decide(h, x.pending, `bad-${k}-${i}`);
+    }
+    assert.equal(h.auth.isPinLocked(), true);
+    const y = await newPending();
+    const page = await getPending(h, authorizeUrl(h, y.clientId, y.challenge));
     assert.equal(page.res.status, 429);
     assert.ok(!page.html.includes('name="pin"'));
-    // restart with same state dir: still locked
-    await h.close();
-    const h2 = await start(h.dir);
-    try {
-      const r2 = await getPending(h2, authorizeUrl(h2, reg.client_id, challenge));
-      assert.equal(r2.res.status, 429);
-    } finally { await h2.close(); }
-    const state = JSON.parse(readFileSync(join(h.dir, 'oauth.json'), 'utf8'));
-    assert.equal(state.pinFailures.length, 5);
-    // reopen so after() can close cleanly
-    h = await start(h.dir);
+    if (y.pending) assert.equal((await decide(h, y.pending, PIN)).status, 429);
+    h.auth.clearPinLockout();
+    assert.equal(h.auth.isPinLocked(), false);
+    const z = await newPending();
+    assert.equal((await decide(h, z.pending, PIN)).status, 303);
+  });
+});
+
+describe('access token hardening + key rotation', () => {
+  let h: Harness;
+  before(async () => { h = await start(); });
+  after(async () => { await h.close(); rmSync(h.dir, { recursive: true, force: true }); });
+
+  const claimsFor = (clientId: string, over: Record<string, unknown> = {}) => {
+    const now = Math.floor(Date.now() / 1000);
+    return { iss: h.base, aud: `${h.base}/mcp`, sub: 'owner' as const, client_id: clientId, scope: 'mcp', iat: now, exp: now + 3600, jti: randomBytes(8).toString('hex'), gen: 1, ...over };
+  };
+
+  test('rejects over-long lifetimes and future iat, even with a valid signature', async () => {
+    const c = await connect(h);
+    const now = Math.floor(Date.now() / 1000);
+    const gen = (JSON.parse(Buffer.from(c.access.split('.')[1]!, 'base64url').toString()) as { gen: number }).gen;
+    const forged = (over: Record<string, unknown>) => signJwt(claimsFor(c.clientId, { gen, ...over }) as any, SECRETS.signingKey);
+    assert.equal((await mcp(h, forged({}))).status, 200);
+    assert.equal((await mcp(h, forged({ exp: now + 10 * 365 * 86400 }))).status, 401);
+    assert.equal((await mcp(h, forged({ exp: now + 3600 + 61 }))).status, 401);
+    assert.equal((await mcp(h, forged({ iat: now + 120, exp: now + 3600 }))).status, 401);
+    assert.equal((await mcp(h, forged({ iat: now + 30, exp: now + 3600 }))).status, 200); // within skew
+  });
+
+  test('revokeAll rotates + persists the signing key; tokens signed with the old key die', async () => {
+    const c = await connect(h);
+    const oldKey = SECRETS.signingKey;
+    h.auth.revokeAll();
+    assert.notEqual(SECRETS.signingKey, oldKey);
+    assert.equal(JSON.parse(readFileSync(join(h.dir, 'secrets.json'), 'utf8')).signingKey, SECRETS.signingKey);
+    // attacker holding the old key guesses the new generation
+    const gen = (JSON.parse(readFileSync(join(h.dir, 'oauth.json'), 'utf8')) as { generation: number }).generation;
+    const forged = signJwt(claimsFor(c.clientId, { gen }) as any, oldKey);
+    assert.equal((await mcp(h, forged)).status, 401);
+    // legitimate reconnect with the new key works
+    const c2 = await connect(h);
+    assert.equal((await mcp(h, c2.access)).status, 200);
+  });
+});
+
+describe('rate limits keyed on the real client address (tunnel)', () => {
+  let h: Harness;
+  before(async () => { h = await start(); });
+  after(async () => { await h.close(); rmSync(h.dir, { recursive: true, force: true }); });
+
+  const tokenFrom = (headers: Record<string, string>, body: Record<string, string>) =>
+    fetch(`${h.base}/token`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', ...headers }, body: new URLSearchParams(body).toString() });
+
+  test('one flooding address does not starve others; known refresh tokens are never counted', async () => {
+    const c = await connect(h);
+    const bad = { grant_type: 'refresh_token', refresh_token: 'x', client_id: 'nope' };
+    let last = 0;
+    for (let i = 0; i < 305; i++) last = (await tokenFrom({ 'cf-connecting-ip': '203.0.113.9' }, bad)).status;
+    assert.equal(last, 429);
+    // a different client address is unaffected
+    assert.notEqual((await tokenFrom({ 'cf-connecting-ip': '198.51.100.7' }, bad)).status, 429);
+    // x-forwarded-for: only the LAST entry counts (appended by our own proxy); rotating the spoofable first entry does not help
+    for (let i = 0; i < 305; i++) last = (await tokenFrom({ 'x-forwarded-for': `10.0.0.${i % 250}, 203.0.113.50` }, bad)).status;
+    assert.equal(last, 429);
+    assert.notEqual((await tokenFrom({ 'x-forwarded-for': '10.0.0.1, 203.0.113.51' }, bad)).status, 429);
+    // the legitimate refresh from the flooded address still goes through
+    const r = await tokenFrom({ 'cf-connecting-ip': '203.0.113.9' }, { grant_type: 'refresh_token', refresh_token: c.refresh, client_id: c.clientId });
+    assert.equal(r.status, 200, await r.text());
   });
 });

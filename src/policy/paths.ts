@@ -1,9 +1,12 @@
+import { lstatSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
 /**
  * Path containment helpers. Windows-looking paths are handled with path.win32 (so this is
- * testable on Linux). Limitations: symlinks/junctions and 8.3 short names are not resolved.
+ * testable on Linux). The purely lexical checks (isInsideAny) do not resolve symlinks/junctions or
+ * 8.3 short names; the realPath* helpers below add that on top, using the real file system of the
+ * OS we run on (so Windows-style paths are only resolved when actually running on Windows).
  */
 
 const WIN_DRIVE = /^[a-zA-Z]:/;
@@ -111,3 +114,70 @@ export function looseKey(s: string): string {
 }
 
 export { dirIsWindows };
+
+// ---- real-path resolution (symlinks, junctions, 8.3 names) -------------------------------------
+
+const MAX_REAL_INPUT = 8192;
+
+/**
+ * Real path of `p` on THIS OS via fs.realpathSync.native. For a path that does not exist, the nearest
+ * existing ancestor is resolved and the missing tail re-appended (so "link/new.txt" is judged by where
+ * "link" really points). Dangling symlinks are followed manually. Returns undefined when `p` cannot
+ * be interpreted on this OS (e.g. "C:\\x" on Linux) - callers then rely on the lexical check only.
+ * `raw` keeps ".." segments for the OS to resolve (matters for "link/.."); otherwise they are
+ * collapsed lexically first (which is what most tools do before touching the disk).
+ */
+function realPathOne(p: string, base: string, raw: boolean): string | undefined {
+  const s = prep(p);
+  if (s === '' || s.length > MAX_REAL_INPUT || s.includes('\0')) return undefined;
+  if (process.platform !== 'win32' && (WIN_DRIVE.test(s) || s.includes('\\'))) return undefined;
+  let cur = path.isAbsolute(s) ? s : base + path.sep + s;
+  if (!raw) cur = path.resolve(cur);
+  const rest: string[] = [];
+  let hops = 0;
+  for (let i = 0; i < 4096; i++) {
+    try {
+      return path.join(realpathSync.native(cur), ...rest.reverse());
+    } catch {
+      // Dangling symlink at this level? Follow it by hand so its target is judged, not its name.
+      try {
+        if (hops < 32 && lstatSync(cur).isSymbolicLink()) {
+          hops++;
+          cur = path.resolve(path.dirname(cur), readlinkSync(cur));
+          continue;
+        }
+      } catch { /* not a link / not readable */ }
+      const parent = path.dirname(cur);
+      if (parent === cur) return path.normalize(cur);
+      rest.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+  return path.normalize(cur);
+}
+
+/** Real-path interpretations of `p` (".."-raw and ".."-collapsed). Empty when not resolvable here. */
+export function realCandidates(p: string, base: string = process.cwd()): string[] {
+  const b = prep(base);
+  const out = new Set<string>();
+  for (const raw of [true, false]) {
+    const r = realPathOne(p, b, raw);
+    if (r !== undefined) out.add(r);
+  }
+  return [...out];
+}
+
+/** Real path(s) of a containment root (a directory setting). */
+export function realRoots(dirs: string[]): string[] {
+  const out = new Set<string>();
+  for (const d of dirs) for (const r of realCandidates(d, path.parse(process.cwd()).root)) out.add(r);
+  return [...out];
+}
+
+/** Native containment test on already-real paths (case-insensitive on Windows via path.relative). */
+export function realContains(root: string, candidate: string): boolean {
+  const rel = path.relative(root, candidate);
+  if (rel === '') return true;
+  const first = rel.split(path.sep)[0];
+  return first !== '..' && !path.isAbsolute(rel);
+}
