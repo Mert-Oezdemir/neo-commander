@@ -1,4 +1,8 @@
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
+import { unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 export const WINDOWS_ONLY = "Bu araç yalnızca Windows'ta çalışır / Windows only";
 
@@ -15,7 +19,11 @@ const MAX_STDOUT = 96 * 1024 * 1024;
 
 export type PsRunner = (script: string, input: unknown, opts?: PsOptions) => Promise<Record<string, unknown>>;
 
-/** Spawn PowerShell, feed the script on stdin, pass user input ONLY via the NEO_ARGS env var (JSON). */
+/**
+ * Run a PowerShell script from a private temp .ps1 file (`-File`); user input travels ONLY via the
+ * NEO_ARGS env var (JSON). `-Command -` (stdin) is not usable: PowerShell 5.1 parses stdin line by
+ * line, which breaks multi-line blocks and C# here-strings.
+ */
 export async function runPowerShell(
   script: string,
   input: unknown,
@@ -28,6 +36,13 @@ export async function runPowerShell(
   const timeoutMs = opts.timeoutMs ?? 20000;
   if (opts.signal?.aborted) throw new PsError('Aborted.');
 
+  // Unpredictable name + exclusive create; UTF-8 BOM so PS 5.1 never misreads the encoding.
+  const scriptPath = join(tmpdir(), `neo-ps-${randomBytes(12).toString('hex')}.ps1`);
+  writeFileSync(scriptPath, '\ufeff' + script + '\r\n', { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+  const cleanup = (): void => {
+    try { unlinkSync(scriptPath); } catch { /* already gone */ }
+  };
+
   return await new Promise<Record<string, unknown>>((resolve, reject) => {
     const child = spawn(
       'powershell.exe',
@@ -38,12 +53,12 @@ export async function runPowerShell(
         '-Sta',
         '-ExecutionPolicy',
         'Bypass',
-        '-Command',
-        '-',
+        '-File',
+        scriptPath,
       ],
       {
         windowsHide: true,
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env, NEO_ARGS: json },
       },
     );
@@ -59,6 +74,7 @@ export async function runPowerShell(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      cleanup();
       opts.signal?.removeEventListener('abort', onAbort);
       fn();
     };
@@ -102,10 +118,6 @@ export async function runPowerShell(
         }
       });
     });
-    child.stdin.on('error', () => {
-      /* process died early; 'close' reports the real reason */
-    });
-    child.stdin.end(script + '\n', 'utf8');
   });
 }
 

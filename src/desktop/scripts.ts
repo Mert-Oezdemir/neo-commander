@@ -1,6 +1,6 @@
 /**
  * PowerShell 5.1 script templates. Rules:
- *  - ASCII only (stdin is decoded with the OEM code page). Non-ASCII output is \uXXXX-escaped by Out-Neo.
+ *  - ASCII only (kept for safety across code pages). Non-ASCII output is \uXXXX-escaped by Out-Neo.
  *  - No user input is ever interpolated; scripts read $env:NEO_ARGS (JSON) into $A.
  *  - Every script prints exactly one JSON object line; failures print {"neoError": "..."}.
  *  - C# is C# 5 only (Add-Type on PS 5.1): no $"", =>, out var, ?. , nameof.
