@@ -88,10 +88,10 @@ async function waitFor(pred: () => boolean, ms = 8000): Promise<void> {
   while (!pred()) { if (Date.now() > end) throw new Error('timeout'); await new Promise((r) => setTimeout(r, 20)); }
 }
 
-test('quick tunnel: starting -> online after health check; url event; stop -> off', async () => {
+test('quick tunnel: starting -> online on edge registration; url event; stop -> off', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'neo-fake-'));
   const fake = join(dir, 'cloudflared');
-  writeFileSync(fake, `#!/usr/bin/env node\nconsole.error('INF |  https://fake-one.trycloudflare.com  |');\nsetInterval(()=>{},1000);\n`);
+  writeFileSync(fake, `#!/usr/bin/env node\nconsole.error('INF |  https://fake-one.trycloudflare.com  |');console.error('INF Registered tunnel connection connIndex=0 location=fra08 protocol=quic');\nsetInterval(()=>{},1000);\n`);
   chmodSync(fake, 0o755);
   let checks = 0;
   const m = new TunnelManager({ stateDir: dir, port: 1, getSettings: () => settings('cloudflare-quick'), cloudflaredPath: fake, healthCheck: async () => ++checks >= 2 });
@@ -104,7 +104,7 @@ test('quick tunnel: starting -> online after health check; url event; stop -> of
   await waitFor(() => m.status().state === 'online');
   assert.equal(m.publicUrl(), 'https://fake-one.trycloudflare.com');
   assert.equal(m.status().stable, false);
-  assert.ok(checks >= 2);
+  await waitFor(() => checks >= 1); // background reachability probe runs, but does not gate online
   assert.ok(seen.includes('starting'));
   assert.deepEqual(urls, ['https://fake-one.trycloudflare.com']);
   await m.stop();
@@ -117,7 +117,7 @@ test('quick tunnel restarts with backoff when process dies', async () => {
   const fake = join(dir, 'cloudflared');
   const counter = join(dir, 'count');
   writeFileSync(counter, '');
-  writeFileSync(fake, `#!/usr/bin/env node\nconst fs=require('fs');fs.appendFileSync(${JSON.stringify(counter)},'x');const n=fs.readFileSync(${JSON.stringify(counter)}).length;console.error('https://run-'+n+'.trycloudflare.com');if(n<2)setTimeout(()=>process.exit(1),100);else setInterval(()=>{},1000);\n`);
+  writeFileSync(fake, `#!/usr/bin/env node\nconst fs=require('fs');fs.appendFileSync(${JSON.stringify(counter)},'x');const n=fs.readFileSync(${JSON.stringify(counter)}).length;console.error('https://run-'+n+'.trycloudflare.com');console.error('INF Registered tunnel connection connIndex=0 location=fra08 protocol=quic');if(n<2)setTimeout(()=>process.exit(1),100);else setInterval(()=>{},1000);\n`);
   chmodSync(fake, 0o755);
   const m = new TunnelManager({ stateDir: dir, port: 1, getSettings: () => settings('cloudflare-quick'), cloudflaredPath: fake, healthCheck: async () => true, restartDelaysMs: [50] });
   await m.start();
@@ -125,15 +125,30 @@ test('quick tunnel restarts with backoff when process dies', async () => {
   await m.stop();
 });
 
-test('quick tunnel goes to error when health never passes', async () => {
+test('quick tunnel: URL alone is not online; registered edge connection is', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'neo-fake-'));
   const fake = join(dir, 'cloudflared');
-  writeFileSync(fake, `#!/usr/bin/env node\nconsole.error('https://never.trycloudflare.com');setInterval(()=>{},1000);\n`);
+  writeFileSync(fake, `#!/usr/bin/env node\nconsole.error('https://slow.trycloudflare.com');setTimeout(()=>console.error('INF Registered tunnel connection connIndex=0'),400);setInterval(()=>{},1000);\n`);
+  chmodSync(fake, 0o755);
+  const m = new TunnelManager({ stateDir: dir, port: 1, getSettings: () => settings('cloudflare-quick'), cloudflaredPath: fake, healthCheck: async () => true });
+  await m.start();
+  await new Promise((r) => setTimeout(r, 150));
+  assert.notEqual(m.status().state, 'online');
+  await waitFor(() => m.status().state === 'online');
+  assert.equal(m.publicUrl(), 'https://slow.trycloudflare.com');
+  await m.stop();
+});
+
+test('quick tunnel stays online (with a hint) when local health check keeps failing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'neo-fake-'));
+  const fake = join(dir, 'cloudflared');
+  writeFileSync(fake, `#!/usr/bin/env node\nconsole.error('https://never.trycloudflare.com');console.error('INF Registered tunnel connection connIndex=0 location=fra08 protocol=quic');setInterval(()=>{},1000);\n`);
   chmodSync(fake, 0o755);
   const m = new TunnelManager({ stateDir: dir, port: 1, getSettings: () => settings('cloudflare-quick'), cloudflaredPath: fake, healthCheck: async () => false, healthTimeoutMs: 1200, restartDelaysMs: [60000] });
   await m.start();
-  await waitFor(() => m.status().state === 'error');
-  assert.equal(m.publicUrl(), undefined);
+  await waitFor(() => /DNS/.test(m.status().message ?? ''));
+  assert.equal(m.status().state, 'online');
+  assert.equal(m.publicUrl(), 'https://never.trycloudflare.com');
   await m.stop();
 });
 

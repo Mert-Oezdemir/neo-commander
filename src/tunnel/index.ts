@@ -195,6 +195,8 @@ export class TunnelManager extends EventEmitter {
     liveChildren.add(child);
     let buf = '';
     let sawUrl = false;
+    let quickUrl: string | undefined;
+    let registered = false;
     let connected = false;
     let lastErr = '';
     const onData = (d: Buffer): void => {
@@ -203,9 +205,19 @@ export class TunnelManager extends EventEmitter {
       buf = (buf + text).slice(-8192);
       const lines = text.split(/\r?\n/).filter((l) => /\b(ERR|error|failed)\b/i.test(l));
       if (lines.length) lastErr = redact(lines[lines.length - 1]).slice(0, 300);
-      if (mode === 'quick' && !sawUrl) {
-        const url = parseQuickTunnelUrl(buf);
-        if (url) { sawUrl = true; void this.waitHealthy(gen, url, () => attempt = 0); }
+      if (mode === 'quick') {
+        // Online = URL known AND cloudflared registered an edge connection. We deliberately do NOT
+        // gate on fetching the URL from this machine: a brand-new trycloudflare hostname is often
+        // NXDOMAIN for a few seconds, and Windows caches that negative answer for up to 15 min,
+        // which made the old health-gate restart the tunnel forever with a fresh URL each time.
+        if (!quickUrl) quickUrl = parseQuickTunnelUrl(buf);
+        if (!registered && /Registered tunnel connection|Connection [0-9a-f-]+ registered/i.test(buf)) registered = true;
+        if (quickUrl && registered && !sawUrl) {
+          sawUrl = true;
+          attempt = 0;
+          this.set({ kind: 'cloudflare-quick', state: 'online', publicUrl: quickUrl, stable: false });
+          void this.verifyInBackground(gen, quickUrl);
+        }
       } else if (mode === 'named' && !connected && /Registered tunnel connection|Connection [0-9a-f-]+ registered/i.test(text)) {
         connected = true;
         attempt = 0;
@@ -231,23 +243,20 @@ export class TunnelManager extends EventEmitter {
     });
   }
 
-  private async waitHealthy(gen: number, url: string, onOk: () => void): Promise<void> {
+  /**
+   * Informational reachability probe after the tunnel is online. Never kills the tunnel (local DNS
+   * may lag behind the public internet); only adds a hint to the status message if it keeps failing.
+   */
+  private async verifyInBackground(gen: number, url: string): Promise<void> {
     const check = this.opts.healthCheck ?? defaultHealthCheck;
-    const deadline = Date.now() + (this.opts.healthTimeoutMs ?? 30000);
-    this.patch({ message: 'Bağlantı doğrulanıyor…' });
+    const deadline = Date.now() + (this.opts.healthTimeoutMs ?? 60000);
     while (gen === this.generation && Date.now() < deadline) {
-      if (await check(url).catch(() => false)) {
-        if (gen !== this.generation) return;
-        onOk();
-        this.set({ kind: 'cloudflare-quick', state: 'online', publicUrl: url, stable: false });
-        return;
-      }
-      await new Promise((r) => setTimeout(r, 1000));
+      if (await check(url).catch(() => false)) return;
+      await new Promise((r) => setTimeout(r, 3000));
     }
-    if (gen !== this.generation) return;
-    // never became reachable: drop the process; the close handler restarts with backoff
-    this.patch({ message: 'Tünel adresi 30 sn içinde yanıt vermedi, yeniden deneniyor…' });
-    if (this.child) killTree(this.child);
+    if (gen === this.generation && this.current.publicUrl === url) {
+      this.patch({ message: 'Tünel açık; bu bilgisayardan adres henüz çözümlenemiyor (DNS gecikmesi olabilir). Claude yine de bağlanabilir.' });
+    }
   }
 
   // ---- tailscale ----
