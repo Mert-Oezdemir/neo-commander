@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, it } from 'node:test';
 import vm from 'node:vm';
 import { desktopTools } from './index.js';
 import { accessibilityMessage, macHooks, MacError, parseJxaOutput, screenRecordingMessage, type ExecResult } from './mac-exec.js';
-import { ALL_MAC_SCRIPTS, SCRIPT_GEOMETRY, SCRIPT_KEYBOARD, SCRIPT_MOUSE, SCRIPT_NOTIFY, SCRIPT_OCR, SCRIPT_WINDOW } from './mac-scripts.js';
+import { ALL_MAC_SCRIPTS, SCRIPT_GEOMETRY, SCRIPT_KEYBOARD, SCRIPT_PASTE, SCRIPT_MOUSE, SCRIPT_NOTIFY, SCRIPT_OCR, SCRIPT_WINDOW } from './mac-scripts.js';
 import { openHooks, screenshotCaption, visionLines } from './mac-tools.js';
 import { hooks, WINDOWS_ONLY, type PsRunner } from './ps.js';
 
@@ -444,10 +444,78 @@ describe('input, windows, clipboard, open, system info', () => {
     const r = await tool('desktop_keyboard').handler({ action: 'type', text: 'Merhaba ğ' }, ctx);
     assert.equal(r.isError, undefined);
     assert.equal(JSON.parse(textOf(r)).method, 'paste');
-    const copies = calls.filter((c) => c.file === '/usr/bin/pbcopy').map((c) => (c.opts as { input: string }).input);
-    assert.deepEqual(copies, ['Merhaba ğ', 'héllo ğ']); // set, then the previous clipboard restored
-    const paste = calls.filter((c) => c.script === SCRIPT_KEYBOARD).pop()!;
-    assert.equal((paste.input as { events: unknown[] }).events.length, 4);
+    // No pbpaste/pbcopy: a text-only snapshot would lose images/files/rich text. One JXA run does it all.
+    assert.equal(calls.filter((c) => c.file === '/usr/bin/pbcopy' || c.file === '/usr/bin/pbpaste').length, 0);
+    const paste = calls.filter((c) => c.script === SCRIPT_PASTE);
+    assert.equal(paste.length, 1);
+    const pin = paste[0]!.input as { text: string; events: unknown[] };
+    assert.equal(pin.text, 'Merhaba ğ');
+    assert.equal(pin.events.length, 4);
+  });
+  it('SCRIPT_PASTE restores every pasteboard item/type and marks the temp item concealed + transient', () => {
+    const run = (initial: { type: string; data: string }[][], clipboardChangesDuringPaste = false) => {
+      type Entry = { type: string; data: string };
+      const state = { items: initial.map((i) => i.map((e) => ({ ...e }))) as Entry[][], changeCount: 1, posted: 0, snapshotDuringPaste: [] as Entry[][] };
+      class Item {
+        entries: Entry[] = [];
+        get types() { return { count: this.entries.length, objectAtIndex: (i: number) => this.entries[i]!.type }; }
+        dataForType(t: string) { const e = this.entries.find((x) => x.type === t); return e ? { length: e.data.length, v: e.data } : undefined; }
+        setDataForType(d: { v: string }, t: string) { this.entries.push({ type: t, data: d.v }); }
+        setStringForType(s: { v: string }, t: string) { this.entries.push({ type: t, data: s.v }); }
+      }
+      const toItems = () => state.items.map((e) => { const it = new Item(); it.entries = e; return it; });
+      const pb = {
+        get pasteboardItems() { const its = toItems(); return { count: its.length, objectAtIndex: (i: number) => its[i] }; },
+        get clearContents() { state.items = []; state.changeCount++; return 0; },
+        writeObjects: (arr: { list: Item[] }) => { state.items = arr.list.map((i) => i.entries); state.changeCount++; return true; },
+        get changeCount() { return state.changeCount; },
+      };
+      const mk = () => ({ list: [] as Item[], addObject(x: Item) { this.list.push(x); } });
+      const $: any = (v: unknown) => ({ v });
+      Object.assign($, {
+        NSProcessInfo: { processInfo: { environment: { objectForKey: () => 'ENV' } } },
+        NSThread: { sleepForTimeInterval: () => { if (clipboardChangesDuringPaste) state.changeCount++; } },
+        NSPasteboard: { generalPasteboard: pb },
+        NSPasteboardItem: { alloc: { get init() { return new Item(); } } },
+        NSMutableArray: { alloc: { get init() { return mk(); } } },
+        NSArray: { arrayWithObject: (x: Item) => ({ list: [x] }) },
+        NSData: { data: { length: 0, v: '' } },
+        AXIsProcessTrusted: () => true,
+        CGEventCreateKeyboardEvent: () => ({}),
+        CGEventSetFlags: () => undefined,
+        CGEventPost: () => { state.posted++; state.snapshotDuringPaste = state.items.map((e) => e.map((x) => ({ ...x }))); },
+      });
+      const ObjC = {
+        import() {},
+        unwrap: (x: unknown) => (x === 'ENV' ? JSON.stringify({ text: 'SECRET', events: [{ t: 'key', code: 9, down: true, flags: 0x100000 }, { t: 'key', code: 9, down: false, flags: 0x100000 }], delay: 0, settleMs: 0 }) : x),
+        deepUnwrap: () => [], castRefToObject: (x: unknown) => x, bindFunction() {},
+      };
+      const out = vm.runInNewContext(SCRIPT_PASTE + '\n;run();', { $, ObjC, Math, JSON, String, Number, Array, Object }, { timeout: 5000 }) as string;
+      return { result: JSON.parse(out) as Record<string, unknown>, state };
+    };
+
+    const clip = [
+      [{ type: 'public.utf8-plain-text', data: 'hello' }, { type: 'public.html', data: '<b>hello</b>' }, { type: 'public.png', data: 'PNGBYTES' }],
+      [{ type: 'public.file-url', data: 'file:///tmp/a' }],
+    ];
+    const a = run(clip);
+    assert.equal(a.result['neoError'], undefined);
+    assert.deepEqual(a.state.items, clip, 'all items and all types restored');
+    assert.equal(a.state.posted, 2);
+    const during = a.state.snapshotDuringPaste;
+    assert.equal(during.length, 1);
+    const types = during[0]!.map((e) => e.type);
+    assert.deepEqual(types.sort(), ['org.nspasteboard.ConcealedType', 'org.nspasteboard.TransientType', 'public.utf8-plain-text']);
+    assert.equal(during[0]!.find((e) => e.type === 'public.utf8-plain-text')!.data, 'SECRET');
+
+    // Empty clipboard stays empty afterwards (the secret must not linger).
+    const b = run([]);
+    assert.deepEqual(b.state.items, []);
+
+    // Something else copied during the paste: do not overwrite it.
+    const c = run(clip, true);
+    assert.equal(c.state.items.length, 1);
+    assert.equal(c.state.items[0]!.find((e) => e.type === 'public.utf8-plain-text')!.data, 'SECRET');
   });
   it('window maximize moves to the work area, restore returns to the previous frame', async () => {
     const calls = stub((s) => (s === SCRIPT_WINDOW ? { ok: true } : (geoOnly(s) ?? {})));

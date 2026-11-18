@@ -1,6 +1,6 @@
 {
   "name": "neo-commander",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Self-hosted remote MCP: let Claude.ai operate your own computer, no paid relay",
   "main": "dist-electron/main.js",
   "scripts": {
@@ -69,6 +69,15 @@
     "asarUnpack": [
       "node_modules/**"
     ],
+    "electronFuses": {
+      "runAsNode": true,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true,
+      "grantFileProtocolExtraPrivileges": false,
+      "resetAdHocDarwinSignature": false
+    },
     "artifactName": "Neo-Commander-${version}-${os}-${arch}.${ext}",
     "win": {
       "target": [

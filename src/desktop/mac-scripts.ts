@@ -426,6 +426,77 @@ export const SCRIPT_CLIPBOARD_INFO = build(String.raw`function main() {
 }
 `);
 
+/**
+ * Clipboard-paste fallback for typing text when JXA cannot bridge CGEventKeyboardSetUnicodeString.
+ * Everything happens in ONE osascript run so the previous clipboard (all items, all types, as raw NSData) can be
+ * held in memory and put back byte-for-byte. The temporary item is marked Concealed + Transient so clipboard
+ * managers do not record it (nspasteboard.org conventions). Text, hotkey events and timings come from NEO_ARGS.
+ */
+export const SCRIPT_PASTE = build(String.raw`var T_TEXT = 'public.utf8-plain-text';
+var T_CONCEALED = 'org.nspasteboard.ConcealedType';
+var T_TRANSIENT = 'org.nspasteboard.TransientType';
+function keyEv(code, down, flags) {
+  var ev = $.CGEventCreateKeyboardEvent(null, code, down);
+  if (flags) { $.CGEventSetFlags(ev, flags); }
+  $.CGEventPost(0, ev);
+}
+function snapshotPasteboard(pb) {
+  var saved = [];
+  var items = pb.pasteboardItems;
+  var n = 0;
+  try { n = items.count; } catch (e0) { n = 0; }
+  for (var i = 0; i < n; i++) {
+    var it = items.objectAtIndex(i);
+    var types = it.types;
+    var entry = [];
+    for (var j = 0; j < types.count; j++) {
+      var t = types.objectAtIndex(j);
+      try {
+        var d = it.dataForType(t);
+        if (d && d.length !== undefined) { entry.push({ type: t, data: d }); }
+      } catch (e1) {}
+    }
+    saved.push(entry);
+  }
+  return saved;
+}
+function restorePasteboard(pb, saved) {
+  pb.clearContents;
+  var objs = $.NSMutableArray.alloc.init;
+  for (var i = 0; i < saved.length; i++) {
+    var ni = $.NSPasteboardItem.alloc.init;
+    for (var j = 0; j < saved[i].length; j++) { ni.setDataForType(saved[i][j].data, saved[i][j].type); }
+    objs.addObject(ni);
+  }
+  if (saved.length > 0) { pb.writeObjects(objs); }
+}
+function main() {
+  requireAx();
+  var pb = $.NSPasteboard.generalPasteboard;
+  var saved = snapshotPasteboard(pb);
+  var tmp = $.NSPasteboardItem.alloc.init;
+  tmp.setStringForType($(String(A.text)), T_TEXT);
+  tmp.setDataForType($.NSData.data, T_CONCEALED);
+  tmp.setDataForType($.NSData.data, T_TRANSIENT);
+  pb.clearContents;
+  pb.writeObjects($.NSArray.arrayWithObject(tmp));
+  var ours = pb.changeCount;
+  var delay = Number(A.delay) || 0;
+  try {
+    var events = A.events || [];
+    for (var k = 0; k < events.length; k++) {
+      keyEv(events[k].code, events[k].down, events[k].flags);
+      if (delay > 0) { sleepMs(delay); }
+    }
+    sleepMs(Number(A.settleMs) || 0);
+  } finally {
+    // Do not clobber something the user copied while we were pasting.
+    if (pb.changeCount === ours) { restorePasteboard(pb, saved); }
+  }
+  return { action: 'paste', chars: String(A.text).length, restoredItems: saved.length };
+}
+`);
+
 /** Notification through StandardAdditions (display notification). Title/message come from NEO_ARGS only. */
 export const SCRIPT_NOTIFY = build(String.raw`function main() {
   var app = Application.currentApplication();
@@ -443,5 +514,6 @@ export const ALL_MAC_SCRIPTS: Record<string, string> = {
   window: SCRIPT_WINDOW,
   ocr: SCRIPT_OCR,
   clipboardInfo: SCRIPT_CLIPBOARD_INFO,
+  paste: SCRIPT_PASTE,
   notify: SCRIPT_NOTIFY,
 };

@@ -13,6 +13,7 @@ import type { ToolDef } from './tools/types.js';
 import { Engine } from './engine/index.js';
 import { ToolRouter, type AuditLike, type PolicyLike, type RateLimiterLike } from './mcp/router.js';
 import { SessionManager } from './mcp/sessions.js';
+import { computeMac, isValidNonce, removeInstanceFile, verifyInstance, writeInstanceFile, type InstanceInfo } from './identity.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 /** Application root (contains package.json): src/ or dist/ is one level below. */
@@ -84,7 +85,8 @@ export interface RunningServer {
 }
 
 export class PortInUseError extends Error {
-  constructor(public port: number, public otherNeoCommander: boolean) {
+  /** otherNeoCommander is true only when the listener proved its identity (see identity.ts), not for any {"ok":true}. */
+  constructor(public port: number, public otherNeoCommander: boolean, public stateDir?: string) {
     super(`Port ${port} kullanımda`);
   }
 }
@@ -100,14 +102,9 @@ export function openUrl(url: string): void {
   } catch { /* ignore */ }
 }
 
-export async function probeHealthz(port: number): Promise<boolean> {
-  try {
-    const r = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(2000) });
-    const j = (await r.json()) as { ok?: boolean };
-    return r.ok && j.ok === true;
-  } catch {
-    return false;
-  }
+/** True only if the listener on <port> proves (HMAC over a fresh nonce) that it is a Neo Commander using <stateDir>. */
+export function probeHealthz(port: number, stateDir: string = defaultStateDir()): Promise<boolean> {
+  return verifyInstance(port, stateDir);
 }
 
 /** Merge a settings patch (tunnel is merged one level deep). */
@@ -197,6 +194,14 @@ export async function startServer(opts: StartOptions = {}): Promise<RunningServe
   app.get('/healthz', (_req, res) => { res.json({ ok: true }); });
 
   const isLoopback = ov.isDirectLoopback ?? (await import('./panel/index.js')).isDirectLoopback;
+  // Identity proof for "is that port really us?" checks; loopback only, so the tunnel never sees it.
+  let instance: InstanceInfo | undefined;
+  app.get('/healthz/identity', (req, res) => {
+    const nonce = req.query.nonce;
+    if (!instance || !isLoopback(req) || !isValidNonce(nonce)) { res.status(404).end(); return; }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ mac: computeMac(instance.instanceKey, nonce) });
+  });
   app.get('/', (req, res) => {
     if (isLoopback(req)) res.redirect('/panel');
     else res.status(404).end();
@@ -229,8 +234,8 @@ export async function startServer(opts: StartOptions = {}): Promise<RunningServe
   await new Promise<void>((resolve, reject) => {
     http.once('error', async (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE') {
-        const other = await probeHealthz(requestedPort);
-        reject(new PortInUseError(requestedPort, other));
+        const other = await probeHealthz(requestedPort, dir);
+        reject(new PortInUseError(requestedPort, other, dir));
       } else reject(err);
     });
     http.listen(requestedPort, '127.0.0.1', () => resolve());
@@ -242,12 +247,14 @@ export async function startServer(opts: StartOptions = {}): Promise<RunningServe
   const port = (http.address() as { port: number }).port;
   portRef.value = port;
   actualPort = port;
+  instance = writeInstanceFile(dir, port);
   auth.onPublicUrlChanged();
 
   let closed = false;
   const close = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    if (instance) removeInstanceFile(dir, instance);
     await tunnel.stop().catch(() => {});
     await sessions.closeAll().catch(() => {});
     await engine.stop().catch(() => {});
@@ -291,7 +298,7 @@ export async function handlePortInUse(e: PortInUseError): Promise<number> {
     if (process.env.NEO_NO_BROWSER !== '1') openUrl(url);
     return 0;
   }
-  console.error(`Hata: ${e.port} numaralı port başka bir program tarafından kullanılıyor.`);
+  console.error(`Hata: ${e.port} numaralı port başka bir program tarafından kullanılıyor (bu Neo Commander olarak doğrulanamadı).`);
   console.error('Çözüm: o programı kapatın ya da panelden/settings.json içinden farklı bir port seçin.');
   return 1;
 }

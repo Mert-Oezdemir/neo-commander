@@ -45,6 +45,7 @@ import { macKeyboardTimeoutMs, parseKeyboardMac, parseMouseMac } from './mac-par
 import { parseMacHotkey } from './mac-keys.js';
 import {
   SCRIPT_CLIPBOARD_INFO,
+  SCRIPT_PASTE,
   SCRIPT_GEOMETRY,
   SCRIPT_KEYBOARD,
   SCRIPT_MOUSE,
@@ -335,15 +336,12 @@ const mouse: Run = async (args, ctx) => {
   return json(await jxa(SCRIPT_MOUSE, input, ctx));
 };
 
+/**
+ * Paste fallback. One JXA run snapshots every clipboard item/type (NSPasteboard), puts the text on the
+ * pasteboard flagged Concealed+Transient, sends cmd+v and restores the snapshot (see SCRIPT_PASTE).
+ */
 async function pasteText(text: string, ctx: ToolContext): Promise<void> {
-  const prev = await execText('/usr/bin/pbpaste', [], { signal: ctx.signal }).catch(() => '');
-  await execText('/usr/bin/pbcopy', [], { input: text, signal: ctx.signal });
-  try {
-    await jxa(SCRIPT_KEYBOARD, { kind: 'hotkey', events: parseMacHotkey('cmd+v'), delay: 15 }, ctx);
-    await macHooks.sleep(300);
-  } finally {
-    await execText('/usr/bin/pbcopy', [], { input: prev, signal: ctx.signal }).catch(() => undefined);
-  }
+  await jxa(SCRIPT_PASTE, { text, events: parseMacHotkey('cmd+v'), delay: 15, settleMs: 300 }, ctx);
 }
 
 const keyboard: Run = async (args, ctx) => {

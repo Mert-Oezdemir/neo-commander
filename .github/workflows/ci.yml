@@ -18,6 +18,8 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -29,7 +31,7 @@ jobs:
         if: hashFiles('ui/package.json') != ''
         shell: bash
         working-directory: ui
-        run: npm ci --no-audit --no-fund && npm run build
+        run: npm ci --ignore-scripts --no-audit --no-fund && npm run build
       # npm test = tsc (server) + tsc -p electron + node --test for both
       - run: npm test
       - name: Desktop smoke (macOS, non-fatal)
@@ -50,6 +52,8 @@ jobs:
     needs: test
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
@@ -59,5 +63,5 @@ jobs:
       - name: Build panel UI (if present)
         if: hashFiles('ui/package.json') != ''
         working-directory: ui
-        run: npm ci --no-audit --no-fund && npm run build
+        run: npm ci --ignore-scripts --no-audit --no-fund && npm run build
       - run: npm run dist:dir -- --linux

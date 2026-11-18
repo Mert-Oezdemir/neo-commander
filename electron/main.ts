@@ -3,7 +3,7 @@
 import { app, BrowserWindow, clipboard, dialog, Menu, nativeImage, Notification, session, shell, Tray, type MenuItemConstructorOptions } from 'electron';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { connectorUrl, isPanelUrl, isSafeExternalUrl, loadingPage, panelOrigin, shouldStartHidden } from './util.js';
+import { connectorUrl, isPanelUrl, isValidConnectorUrl, loadingPage, mayGrantPermission, mayOpenExternal, panelOrigin, portInUseMessage, shouldStartHidden } from './util.js';
 
 type ServerModule = typeof import('../dist/server.js');
 type RunningServer = import('../dist/server.js').RunningServer;
@@ -66,14 +66,15 @@ function applyLoginItem(enabled: boolean): { ok: boolean; message: string } {
 
 // ---- window ----
 function lockDownWebContents(wc: Electron.WebContents, getPort: () => number): void {
+  // External links: only when the page asking is the verified panel itself and the target is allowlisted.
   wc.setWindowOpenHandler(({ url }) => {
-    if (isSafeExternalUrl(url)) void shell.openExternal(url);
+    if (mayOpenExternal(wc.getURL(), getPort(), url)) void shell.openExternal(url);
     return { action: 'deny' };
   });
+  // Navigation away from the panel is blocked outright (never forwarded to the OS browser).
   const guard = (event: Electron.Event, url: string) => {
     if (isPanelUrl(url, getPort())) return;
     event.preventDefault();
-    if (isSafeExternalUrl(url)) void shell.openExternal(url);
   };
   wc.on('will-navigate', guard);
   wc.on('will-redirect', guard);
@@ -168,7 +169,13 @@ async function refreshTrayMenu(force = false): Promise<void> {
       label: link ? 'Bağlantı linkini kopyala' : 'Bağlantı linkini kopyala (tünel hazırlanıyor…)',
       enabled: Boolean(link),
       click: () => {
-        if (link) { clipboard.writeText(link); notify('Bağlantı kopyalandı', 'Claude.ai → Ayarlar → Bağlayıcılar bölümüne yapıştırın.'); }
+        if (!link) return;
+        if (!isValidConnectorUrl(link)) {
+          notify('Bağlantı kopyalanmadı', 'Bağlantı adresi beklenen biçimde değil (https://…/mcp, IP adresi olmayan bir alan adı). Panelden kontrol edin.');
+          return;
+        }
+        clipboard.writeText(link);
+        notify('Bağlantı kopyalandı', 'Claude.ai → Ayarlar → Bağlayıcılar bölümüne yapıştırın.');
       },
     },
     c.own
@@ -217,9 +224,11 @@ class OwnController implements Controller {
 /** Another Neo Commander (e.g. started from the command line) already owns the port: just show its panel. */
 class ExternalController implements Controller {
   readonly own = false;
-  constructor(readonly port: number) {}
+  constructor(readonly port: number, private verify: () => Promise<boolean>) {}
   private async state(): Promise<{ connectorUrl?: string | null; paused?: boolean } | null> {
     try {
+      // Re-prove identity every time: the verified instance may have exited and been replaced by a squatter.
+      if (!(await this.verify())) return null;
       const r = await fetch(`http://127.0.0.1:${this.port}/panel/api/state`, { signal: AbortSignal.timeout(2000) });
       return r.ok ? ((await r.json()) as { connectorUrl?: string | null; paused?: boolean }) : null;
     } catch { return null; }
@@ -242,8 +251,12 @@ async function startNeo(): Promise<Controller> {
     return new OwnController(server);
   } catch (e) {
     if (e instanceof mod.PortInUseError) {
-      if (e.otherNeoCommander) return new ExternalController(e.port);
-      throw new Error(`${e.port} numaralı port başka bir program tarafından kullanılıyor. Programı kapatın veya ayar dosyasından farklı bir port seçin.`);
+      // otherNeoCommander is only true when the listener answered the HMAC identity challenge.
+      if (e.otherNeoCommander && e.stateDir) {
+        const dir = e.stateDir; const port = e.port;
+        return new ExternalController(port, () => mod.probeHealthz(port, dir));
+      }
+      throw new Error(portInUseMessage(e.port));
     }
     throw e;
   }
@@ -252,9 +265,11 @@ async function startNeo(): Promise<Controller> {
 // ---- app lifecycle ----
 function hardenSession(): void {
   const ses = session.defaultSession;
-  // Deny every permission except the sanitized clipboard write used by the panel's "Kopyala" button.
-  ses.setPermissionRequestHandler((_wc, permission, cb) => cb(permission === 'clipboard-sanitized-write'));
-  ses.setPermissionCheckHandler((_wc, permission) => permission === 'clipboard-sanitized-write');
+  // Deny every permission except the sanitized clipboard write used by the panel's "Kopyala" button,
+  // and even that only for the verified panel origin.
+  const port = () => controller?.port;
+  ses.setPermissionRequestHandler((_wc, permission, cb, details) => cb(mayGrantPermission(permission, details.requestingUrl, port())));
+  ses.setPermissionCheckHandler((_wc, permission, requestingOrigin) => mayGrantPermission(permission, requestingOrigin, port()));
   ses.setDevicePermissionHandler(() => false);
 }
 
