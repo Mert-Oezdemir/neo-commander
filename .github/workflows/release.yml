@@ -3,6 +3,8 @@ name: Release
 on:
   push:
     tags: ['v*']
+    # Pushing the `release` branch publishes v<package.json version> (tag is created by the release job).
+    branches: [release]
   workflow_dispatch:
 
 permissions:
@@ -58,12 +60,24 @@ jobs:
 
   release:
     name: GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/release'
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: package.json
+          sparse-checkout-cone-mode: false
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tag="$GITHUB_REF_NAME"; else tag="v$(node -p 'require("./package.json").version')"; fi
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || { echo "bad tag: $tag"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
@@ -72,8 +86,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           files=$(ls artifacts/*.exe artifacts/*.dmg)
           echo "$files"
-          gh release create "$GITHUB_REF_NAME" $files --title "Neo Commander ${GITHUB_REF_NAME#v}" --generate-notes \
-            || gh release upload "$GITHUB_REF_NAME" $files --clobber
+          gh release create "$TAG" $files --target "$GITHUB_SHA" --title "Neo Commander ${TAG#v}" --generate-notes \
+            || gh release upload "$TAG" $files --clobber
